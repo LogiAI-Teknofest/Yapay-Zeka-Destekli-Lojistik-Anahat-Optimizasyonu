@@ -1,0 +1,38 @@
+# === Python Özel Dosyaları ===
+# Derlenmiş python dosyaları (Repoda kalabalık yapmasın)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# === Sanal Ortamlar (Virtual Environments) ===
+# .venv klasörü her bilgisayara özeldir, ASLA pushlanmamalıdır
+.venv/
+venv/
+ENV/
+env/
+
+# === Proje ve IDE Ayarları ===
+# VS Code kullananların kişisel editör ayarları
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# === Yarışma Veri Setleri ve Çıktılar ===
+# Gerçek veri setleri (.xlsx veya .csv) ve yerel test çıktıları büyük boyutlu 
+# olacağı için repoyu şişirmemeli. Sadece kodlar kalmalı.
+*.xlsx
+*.xls
+*.csv
+outputs/
+test_outputs/
+
+# === İşletim Sistemi Dosyaları ===
+# Windows ve Mac'in klasör içi otomatik ürettiği gizli dosyalar
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
