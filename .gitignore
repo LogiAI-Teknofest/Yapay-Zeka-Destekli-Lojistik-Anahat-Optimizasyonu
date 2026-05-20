@@ -36,3 +36,7 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 .DS_Store
+
+# === Yarışma Raporları ===
+# Önrapor PDF dosyası git geçmişinden silindiği için yerel klasörde bulunsa dahi tekrar track edilmemeli.
+*.pdf

@@ -1,0 +1,53 @@
+services:
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    container_name: logiai-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data:z          # ham veri + işlenmiş çıktılar host'tan mount (z flag'i ile)
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DATA_DIR=/app/data/raw
+      - OUTPUT_DIR=/app/data/processed
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dashboard
+    container_name: logiai-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - API_BASE=http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: logiai-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data            # kalıcı veri
+    restart: unless-stopped
+
+volumes:
+  redis_data:
