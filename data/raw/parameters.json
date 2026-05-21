@@ -1,0 +1,45 @@
+{
+  "sehirler": [
+    {"id": "IST", "ad": "İstanbul", "lat": 41.0082, "lon": 28.9784, "tm_var": true, "tm_kapasite": 50000, "tir_yanasma": true},
+    {"id": "ANK", "ad": "Ankara", "lat": 39.9334, "lon": 32.8597, "tm_var": true, "tm_kapasite": 40000, "tir_yanasma": true},
+    {"id": "IZM", "ad": "İzmir", "lat": 38.4237, "lon": 27.1428, "tm_var": true, "tm_kapasite": 35000, "tir_yanasma": true},
+    {"id": "BUR", "ad": "Bursa", "lat": 40.1828, "lon": 29.0667, "tm_var": true, "tm_kapasite": 20000, "tir_yanasma": false},
+    {"id": "ANT", "ad": "Antalya", "lat": 36.8969, "lon": 30.7133, "tm_var": true, "tm_kapasite": 25000, "tir_yanasma": true},
+    {"id": "KON", "ad": "Konya", "lat": 37.8746, "lon": 32.4932, "tm_var": true, "tm_kapasite": 18000, "tir_yanasma": false},
+    {"id": "GAZ", "ad": "Gaziantep", "lat": 37.0662, "lon": 37.3833, "tm_var": true, "tm_kapasite": 22000, "tir_yanasma": true},
+    {"id": "KAY", "ad": "Kayseri", "lat": 38.7312, "lon": 35.4787, "tm_var": true, "tm_kapasite": 15000, "tir_yanasma": false},
+    {"id": "TRB", "ad": "Trabzon", "lat": 41.0027, "lon": 39.7168, "tm_var": true, "tm_kapasite": 12000, "tir_yanasma": false},
+    {"id": "ESK", "ad": "Eskişehir", "lat": 39.7767, "lon": 30.5206, "tm_var": false},
+    {"id": "SAK", "ad": "Sakarya", "lat": 40.6940, "lon": 30.4358, "tm_var": false},
+    {"id": "DEN", "ad": "Denizli", "lat": 37.7765, "lon": 29.0864, "tm_var": false}
+  ],
+  "arac_tipleri": [
+    {"id": "TIR", "ad": "Tır", "kapasite_desi": 8000, "sabit_maliyet": 4500, "km_basi_maliyet": 18.5, "tir_yanasma_gerekli": true},
+    {"id": "KAM", "ad": "Kamyon", "kapasite_desi": 5000, "sabit_maliyet": 2800, "km_basi_maliyet": 14.0, "tir_yanasma_gerekli": false},
+    {"id": "HAF", "ad": "Hafif Kamyon", "kapasite_desi": 2500, "sabit_maliyet": 1500, "km_basi_maliyet": 9.5, "tir_yanasma_gerekli": false},
+    {"id": "KMT", "ad": "Kamyonet", "kapasite_desi": 1000, "sabit_maliyet": 600, "km_basi_maliyet": 5.0, "tir_yanasma_gerekli": false}
+  ],
+  "kirali_filo": [
+    {"arac_id": "K1", "tip": "TIR", "sabit_gunluk": 4500, "rotalar": ["IST-ANK", "IST-IZM", "ANK-GAZ"]},
+    {"arac_id": "K2", "tip": "TIR", "sabit_gunluk": 4500, "rotalar": ["IST-ANT", "ANK-KAY"]},
+    {"arac_id": "K3", "tip": "KAM", "sabit_gunluk": 2800, "rotalar": ["IST-BUR", "ANK-KON", "IZM-DEN"]},
+    {"arac_id": "K4", "tip": "KAM", "sabit_gunluk": 2800, "rotalar": ["IZM-ANT", "BUR-ESK"]},
+    {"arac_id": "K5", "tip": "HAF", "sabit_gunluk": 1500, "rotalar": ["ANK-ESK", "IST-SAK", "KON-KAY"]},
+    {"arac_id": "K6", "tip": "HAF", "sabit_gunluk": 1500, "rotalar": ["GAZ-ANT", "TRB-ANK"]},
+    {"arac_id": "K7", "tip": "KMT", "sabit_gunluk": 600, "rotalar": ["IST-SAK", "ESK-ANK"]},
+    {"arac_id": "K8", "tip": "KMT", "sabit_gunluk": 600, "rotalar": ["BUR-IZM", "DEN-IZM"]}
+  ],
+  "sla_parametreleri": {
+    "hat_basi_deadline_saat": 24,
+    "uzun_hat_deadline_saat": 48,
+    "gecikme_ceza_katsayisi": 15.0
+  },
+  "tm_ellemcele_parametreleri": {
+    "asim_ceza_katsayisi": 8.0
+  },
+  "optimizasyon": {
+    "sure_limit_dk": 10,
+    "cozucu": "OR-Tools",
+    "strateji": "PATH_CHEAPEST_ARC"
+  }
+}
