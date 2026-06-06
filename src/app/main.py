@@ -13,16 +13,22 @@ Modüller:
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Literal
 import json, os, datetime, sys
 from pathlib import Path
 
 # Proje kök dizinini sys.path'e ekle (container içinde src/ doğrudan erişilebilir)
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
 
-from src.optimization.pipeline import run_optimization_pipeline
+from optimization.greedy import run_greedy_assignment
+from optimization.vrp_solver import run_spot_vrp
+from models.data_types import PipelineResult, RentalAssignment, SpotAssignment
+from utils.data_loader import load_input, available_dates, DataContractError
 
 app = FastAPI(
     title="Lojistik Optimizasyon API",
@@ -39,29 +45,49 @@ app.add_middleware(
 )
 
 # Proje kök dizini: src/app/main.py → ../../ (proje kökü)
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(_PROJECT_ROOT, "data", "raw"))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(_PROJECT_ROOT, "data", "processed"))
+INPUT_JSON = os.environ.get("INPUT_JSON", os.path.join(DATA_DIR, "logiai_mvp_input.json"))
 
 # ──────────────────────────────────────────────
-#  Modeller (Pydantic)
+#  Modeller (Pydantic) — Yeni pipeline çıktı şemasına uyumlu
 # ──────────────────────────────────────────────
 
 class OptimizeRequest(BaseModel):
     tarih: str = Field(..., description="Planlama tarihi (YYYY-MM-DD)")
-    hedef_filo_kullanim: float = Field(0.7, ge=0, le=1, description="Kiralık filo kullanım oranı")
-    spot_limit: int = Field(20, ge=0, description="Maks spot araç sayısı")
-    sla_katsayi: float = Field(15.0, ge=0, description="SLA gecikme ceza katsayısı")
-    ellemcele_katsayi: float = Field(8.0, ge=0, description="TM elleçleme aşım ceza katsayısı")
+    time_limit: int = Field(540, ge=1, description="OR-Tools zaman sınırı (saniye)")
+
+class RentalAssignmentResponse(BaseModel):
+    vehicle_id: str
+    origin: str
+    destination: str
+    assigned_desi: float
+    capacity_desi: float
+    utilisation: float
+    cost: float
+    cost_type: str
+
+class SpotAssignmentResponse(BaseModel):
+    vehicle_type: str
+    origin: str
+    destination: str
+    assigned_desi: float
+    capacity_desi: float
+    utilisation: float
+    cost: float
+    route_path: list[str]
+    source: str
 
 class OptimizeResponse(BaseModel):
-    status: str
-    toplam_maliyet: float
-    kirali_maliyet: float
-    spot_maliyet: float
-    ceza_maliyet: float
-    rotalar: list
-    tm_durum: list
+    date: str
+    solver_status: str
+    total_rental_cost: float
+    total_spot_cost: float
+    total_cost: float
+    fallback_count: int
+    unassigned_demand: dict
+    rental_assignments: list[RentalAssignmentResponse]
+    spot_assignments: list[SpotAssignmentResponse]
     calisma_suresi_sn: float
 
 class TMDurum(BaseModel):
@@ -130,6 +156,82 @@ def get_demand_for_date(demand_data, date_str):
     """Tarihe ait talepleri filtrele"""
     return [r for r in demand_data if r["tarih"] == date_str]
 
+def _run_pipeline(data: dict, date: str, time_limit_sec: int = 540) -> dict:
+    """
+    İki aşamalı optimizasyon boru hattını çalıştırır ve JSON-uyumlu dict döner.
+
+    Aşama 1 → Greedy kiralık atama   (optimization.greedy)
+    Aşama 2 → OR-Tools Open VRP      (optimization.vrp_solver)
+    """
+    # Aşama 1: Greedy Kiralık Atama
+    rental_assignments_list, spill_demand = run_greedy_assignment(data, date)
+    total_rental_cost = sum(a.cost for a in rental_assignments_list)
+
+    # Aşama 2: Spot VRP + Fallback
+    spot_assignments_list = run_spot_vrp(data, spill_demand, time_limit_sec)
+    total_spot_cost = sum(a.cost for a in spot_assignments_list)
+
+    # Çözücü Durum Kodu
+    fallback_count = sum(1 for a in spot_assignments_list if a.is_fallback)
+
+    if not spill_demand:
+        solver_status = "NO_DEMAND"
+    elif fallback_count > 0:
+        solver_status = "FALLBACK"
+    elif spot_assignments_list:
+        solver_status = "FEASIBLE"
+    else:
+        solver_status = "OPTIMAL"
+
+    # Atanamayan Talep Kontrolü
+    assigned_spill: dict[tuple[str, str], float] = {}
+    for a in spot_assignments_list:
+        key = (a.origin, a.destination)
+        assigned_spill[key] = assigned_spill.get(key, 0.0) + a.assigned_desi
+
+    unassigned: dict[str, float] = {}
+    for (o, d), desi in spill_demand.items():
+        leftover = desi - assigned_spill.get((o, d), 0.0)
+        if leftover > 1.0:
+            unassigned[f"{o}_{d}"] = leftover
+
+    return {
+        "date": date,
+        "solver_status": solver_status,
+        "total_rental_cost": total_rental_cost,
+        "total_spot_cost": total_spot_cost,
+        "total_cost": total_rental_cost + total_spot_cost,
+        "fallback_count": fallback_count,
+        "unassigned_demand": unassigned,
+        "rental_assignments": [
+            {
+                "vehicle_id":    a.vehicle_id,
+                "origin":        a.origin,
+                "destination":   a.destination,
+                "assigned_desi": a.assigned_desi,
+                "capacity_desi": a.capacity_desi,
+                "utilisation":   round(a.utilisation_rate, 4),
+                "cost":          a.cost,
+                "cost_type":     a.cost_type,
+            }
+            for a in rental_assignments_list
+        ],
+        "spot_assignments": [
+            {
+                "vehicle_type":  a.vehicle_type,
+                "origin":        a.origin,
+                "destination":   a.destination,
+                "assigned_desi": a.assigned_desi,
+                "capacity_desi": a.capacity_desi,
+                "utilisation":   round(a.utilisation_rate, 4),
+                "cost":          a.cost,
+                "route_path":    list(a.route_path),
+                "source":        a.source,
+            }
+            for a in spot_assignments_list
+        ],
+    }
+
 # calc_spot_cost ve select_spot_vehicle artık kullanılmıyor;
 # spot araç seçimi OR-Tools tarafından pipeline içinde yapılıyor.
 
@@ -164,109 +266,33 @@ def optimize(req: OptimizeRequest):
       ve SLA gecikme (γ_ij) kısıtlarıyla OR-Tools'a verilir.
       Süre aşımında Fallback (B Planı) devreye girer.
     """
-    start       = datetime.datetime.now()
-    params      = load_params()
-    demand_data = load_demand()
-    dist_matrix = load_distance_matrix()
-    time_matrix = load_travel_time_matrix()
+    start = datetime.datetime.now()
 
-    date_demands = get_demand_for_date(demand_data, req.tarih)
-    if not date_demands:
-        raise HTTPException(404, f"{req.tarih} tarihi için talep verisi bulunamadı")
+    # JSON girdi dosyasını yükle
+    if not os.path.exists(INPUT_JSON):
+        raise HTTPException(404, f"Girdi dosyası bulunamadı: {INPUT_JSON}")
 
-    # O-D sözlüğü oluştur
-    od_demands: dict = {}
-    for r in date_demands:
-        key = f"{r['gonderen_id']}-{r['alan_id']}"
-        od_demands[key] = od_demands.get(key, 0) + int(r["talep_desi"])
+    try:
+        data = load_input(INPUT_JSON)
+    except DataContractError as e:
+        raise HTTPException(400, f"Veri sözleşmesi hatası: {e}")
 
-    # Request'ten gelen ceza katsayılarını params üzerine uygula
-    params["sla_parametreleri"]["gecikme_ceza_katsayisi"]          = req.sla_katsayi
-    params["tm_ellemcele_parametreleri"]["asim_ceza_katsayisi"]    = req.ellemcele_katsayi
-    params["optimizasyon"]["sure_limit_dk"]                        = 10  # şartname: 10 dk
-
-    # ── İki Aşamalı Pipeline ──────────────────────────────────────────────────
-    result = run_optimization_pipeline(od_demands, dist_matrix, time_matrix, params)
-
-    rental_plan = result["rental_fleet_plan"]
-    spot_plan   = result["spot_fleet_plan"]
-
-    # ── Rota listesini birleştir ──────────────────────────────────────────────
-    rotalar = []
-
-    # Kiralık araç rotaları
-    for v in rental_plan:
-        for atama in v.get("atanan_rotalar", []):
-            src, dst = atama["rota"].split("-", 1)
-            rotalar.append({
-                "arac_id":   v["arac_id"],
-                "tip":       "kirali",
-                "arac_tipi": v["tip"],
-                "rota":      atama["rota"],
-                "kaynak":    src,
-                "hedef":     dst,
-                "yuk_desi":  atama["yuk_desi"],
-                "mesafe_km": dist_matrix.get(src, {}).get(dst, 0),
-                "sure_saat": time_matrix.get(src, {}).get(dst, 0),
-                "maliyet":   v["sabit_gunluk"],
-                "sla_deadline": params["sla_parametreleri"]["uzun_hat_deadline_saat"]
-                                if dist_matrix.get(src, {}).get(dst, 0) > 500
-                                else params["sla_parametreleri"]["hat_basi_deadline_saat"],
-                "gecikme_saat": 0.0,
-                "sla_ceza":     0.0,
-            })
-
-    # Spot araç rotaları
-    for i, r in enumerate(spot_plan.get("rotalar", []), 1):
-        rotalar.append({
-            "arac_id":    f"S{i}",
-            "tip":        "spot",
-            "arac_tipi":  r.get("arac_tipi", "?"),
-            "rota":       r.get("rota", ""),
-            "kaynak":     r.get("kaynak", ""),
-            "hedef":      r.get("hedef", ""),
-            "yuk_desi":   r.get("yuk_desi", 0),
-            "mesafe_km":  r.get("mesafe_km", 0),
-            "sure_saat":  0.0,
-            "maliyet":    r.get("maliyet", 0),
-            "sla_deadline": 0.0,
-            "gecikme_saat": 0.0,
-            "sla_ceza":     r.get("sla_ceza", 0),
-        })
-
-    # ── TM elleçleme durumu ──────────────────────────────────────────────────
-    tm_durum = []
-    tm_cities = [c for c in params["sehirler"] if c.get("tm_var")]
-    for tm in tm_cities:
-        total_flow = sum(
-            int(r["talep_desi"])
-            for r in date_demands
-            if r["gonderen_id"] == tm["id"] or r["alan_id"] == tm["id"]
+    # Tarih kontrolü
+    dates = available_dates(data)
+    if req.tarih not in dates:
+        raise HTTPException(
+            404,
+            f"{req.tarih} tarihi için talep verisi bulunamadı. "
+            f"Mevcut tarihler: {dates}"
         )
-        kapasite  = tm["tm_kapasite"]
-        asim      = max(0, total_flow - kapasite)
-        asim_cost = asim * req.ellemcele_katsayi
-        tm_durum.append({
-            "tm_id":       tm["id"],
-            "tm_ad":       tm["ad"],
-            "kapasite":    kapasite,
-            "yuk":         total_flow,
-            "asim":        asim,
-            "asim_maliyet": round(asim_cost, 2),
-        })
+
+    # İki Aşamalı Pipeline
+    result = _run_pipeline(data, req.tarih, time_limit_sec=req.time_limit)
 
     elapsed = (datetime.datetime.now() - start).total_seconds()
+    result["calisma_suresi_sn"] = round(elapsed, 3)
 
-    return OptimizeResponse(
-        status="completed" if "Başarılı" in spot_plan.get("status", "") else spot_plan.get("status", "completed"),
-        toplam_maliyet=result["toplam_maliyet"],
-        kirali_maliyet=result["kirali_maliyet"],
-        spot_maliyet=result["spot_maliyet"],
-        ceza_maliyet=result["ceza_maliyet"],
-        rotalar=rotalar,
-        tm_durum=tm_durum,
-        calisma_suresi_sn=round(elapsed, 3),
-    )
+    return result
 
 @app.get("/api/predict")
 def predict(
