@@ -82,7 +82,7 @@ def load_params():
 @st.cache_data(ttl=60)
 def load_demand_data():
     try:
-        r = requests.get(f"{API_BASE}/api/demand", timeout=10)
+        r = requests.get(f"{API_BASE}/api/demand")
         return r.json()
     except:
         return {"toplam_kayit": 0, "talepler": []}
@@ -108,14 +108,14 @@ def run_optimization(tarih, sla, ellemcele, spot, filo):
 
 def get_tm_status(tarih):
     try:
-        r = requests.get(f"{API_BASE}/api/tm-status", params={"tarih": tarih}, timeout=10)
+        r = requests.get(f"{API_BASE}/api/tm-status", params={"tarih": tarih})
         return r.json()
     except:
         return []
 
 def get_fleet():
     try:
-        r = requests.get(f"{API_BASE}/api/fleet", timeout=10)
+        r = requests.get(f"{API_BASE}/api/fleet")
         return r.json()
     except:
         return []
@@ -144,18 +144,18 @@ if page == "Genel Bakış":
     with st.spinner("Optimizasyon çalıştırılıyor..."):
         result = run_optimization(tarih_str, sla_katsayi, ellemcele_katsayi, spot_limit, filo_kullanim)
     
-    if result and result.get("status") == "completed":
+    if result and result.get("solver_status"):
         # KPI Kartları
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            st.metric("💰 Toplam Maliyet", f"₺{result['toplam_maliyet']:,.0f}")
+            st.metric("💰 Toplam Maliyet", f"₺{result['total_cost']:,.0f}")
         with col2:
-            st.metric("🚛 Kiralı Maliyet", f"₺{result['kirali_maliyet']:,.0f}")
+            st.metric("🚛 Kiralı Maliyet", f"₺{result['total_rental_cost']:,.0f}")
         with col3:
-            st.metric("🔄 Spot Maliyet", f"₺{result['spot_maliyet']:,.0f}")
+            st.metric("🔄 Spot Maliyet", f"₺{result['total_spot_cost']:,.0f}")
         with col4:
-            st.metric("⚠️ Ceza Maliyet", f"₺{result['ceza_maliyet']:,.0f}")
+            st.metric("📊 Durum", result['solver_status'])
         
         st.divider()
         
@@ -165,9 +165,8 @@ if page == "Genel Bakış":
         with col_left:
             st.subheader("Maliyet Dağılımı")
             cost_data = pd.DataFrame({
-                "Kalem": ["Kiralık Filo", "Spot Araçlar", "SLA Cezası", "TM Aşım Cezası"],
-                "Tutar": [result["kirali_maliyet"], result["spot_maliyet"],
-                          result["ceza_maliyet"] * 0.6, result["ceza_maliyet"] * 0.4],
+                "Kalem": ["Kiralık Filo", "Spot Araçlar"],
+                "Tutar": [result["total_rental_cost"], result["total_spot_cost"]],
             })
             fig_pie = px.pie(cost_data, values="Tutar", names="Kalem",
                            color_discrete_sequence=px.colors.qualitative.Set2)
@@ -175,19 +174,23 @@ if page == "Genel Bakış":
             st.plotly_chart(fig_pie, use_container_width=True)
         
         with col_right:
-            st.subheader("Rota Özeti")
-            rotalar_df = pd.DataFrame(result["rotalar"])
-            if not rotalar_df.empty:
-                tip_count = rotalar_df.groupby(["tip", "arac_tipi"]).size().reset_index(name="sayi")
-                tip_count["label"] = tip_count["arac_tipi"].map(ARAC_EMOJI) + " " + tip_count["arac_tipi"]
-                fig_bar = px.bar(tip_count, x="label", y="sayi", color="tip",
-                               color_discrete_map={"kirali": "#2ca02c", "spot": "#d62728"},
-                               title="Araç Tipi Dağılımı")
-                fig_bar.update_layout(height=350)
-                st.plotly_chart(fig_bar, use_container_width=True)
+            st.subheader("Atama Özeti")
+            rental_count = len(result.get("rental_assignments", []))
+            spot_count = len(result.get("spot_assignments", []))
+            fallback_count = result.get("fallback_count", 0)
+            summary_data = pd.DataFrame({
+                "Kategori": ["Kiralık Atama", "Spot Atama", "Fallback"],
+                "Adet": [rental_count, spot_count - fallback_count, fallback_count],
+            })
+            fig_bar = px.bar(summary_data, x="Kategori", y="Adet",
+                           color="Kategori",
+                           color_discrete_map={"Kiralık Atama": "#2ca02c", "Spot Atama": "#1f77b4", "Fallback": "#d62728"},
+                           title="Atama Dağılımı")
+            fig_bar.update_layout(height=350)
+            st.plotly_chart(fig_bar, use_container_width=True)
         
         # Çalışma süresi
-        st.caption(f"⏱️ Optimizasyon süresi: {result['calisma_suresi_sn']:.3f} sn | Tarih: {tarih_str}")
+        st.caption(f"⏱️ Optimizasyon süresi: {result.get('calisma_suresi_sn', 0):.3f} sn | Tarih: {tarih_str} | Durum: {result.get('solver_status', '?')}")
 
 # ══════════════════════════════════════════════
 #  SAYFA 2: ROTA HARİTASI
@@ -221,34 +224,49 @@ elif page == "Rota Haritası":
                 icon=folium.Icon(color="gray", icon="circle", prefix="fa"),
             ).add_to(m)
     
-    # Rota çizgileri
-    if result and result.get("rotalar"):
-        for r in result["rotalar"]:
-            src = cities.get(r["kaynak"])
-            dst = cities.get(r["hedef"])
+    # Rota çizgileri — Kiralık atamalar
+    if result:
+        for r in result.get("rental_assignments", []):
+            src = cities.get(r["origin"])
+            dst = cities.get(r["destination"])
             if src and dst:
-                color = COLORS.get(r["arac_tipi"], "#333")
-                weight = 4 if r["tip"] == "kirali" else 2
-                dash = "solid" if r["tip"] == "kirali" else "10, 5"
-                
                 folium.PolyLine(
                     locations=[[src["lat"], src["lon"]], [dst["lat"], dst["lon"]]],
-                    color=color,
-                    weight=weight,
+                    color="#2ca02c",
+                    weight=4,
                     opacity=0.7,
-                    dash_array=dash if r["tip"] == "spot" else None,
-                    popup=f"{r['arac_id']} ({r['tip']}) | {r['kaynak']}→{r['hedef']} | {r['yuk_desi']} desi | ₺{r['maliyet']:,.0f}",
+                    popup=f"{r['vehicle_id']} (kiralık) | {r['origin']}→{r['destination']} | {r['assigned_desi']:.0f} desi | ₺{r['cost']:,.0f}",
+                ).add_to(m)
+        
+        # Spot atamalar
+        for r in result.get("spot_assignments", []):
+            src = cities.get(r["origin"])
+            dst = cities.get(r["destination"])
+            if src and dst:
+                folium.PolyLine(
+                    locations=[[src["lat"], src["lon"]], [dst["lat"], dst["lon"]]],
+                    color="#d62728",
+                    weight=2,
+                    opacity=0.7,
+                    dash_array="10, 5",
+                    popup=f"{r['vehicle_type']} (spot/{r['source']}) | {r['origin']}→{r['destination']} | {r['assigned_desi']:.0f} desi | ₺{r['cost']:,.0f}",
                 ).add_to(m)
     
     st_data = st_folium(m, width=900, height=600)
     
     # Rota tablosu
-    if result and result.get("rotalar"):
-        st.subheader("Rota Detayları")
-        df_routes = pd.DataFrame(result["rotalar"])
-        display_cols = ["arac_id", "tip", "arac_tipi", "kaynak", "hedef", "yuk_desi", "mesafe_km", "sure_saat", "maliyet"]
-        st.dataframe(df_routes[[c for c in display_cols if c in df_routes.columns]],
-                    use_container_width=True, hide_index=True)
+    if result:
+        st.subheader("Kiralık Atamalar")
+        rental_data = result.get("rental_assignments", [])
+        if rental_data:
+            df_rental = pd.DataFrame(rental_data)
+            st.dataframe(df_rental, use_container_width=True, hide_index=True)
+        
+        st.subheader("Spot Atamalar")
+        spot_data = result.get("spot_assignments", [])
+        if spot_data:
+            df_spot = pd.DataFrame(spot_data)
+            st.dataframe(df_spot, use_container_width=True, hide_index=True)
 
 # ══════════════════════════════════════════════
 #  SAYFA 3: TRANSFER MERKEZLERİ
