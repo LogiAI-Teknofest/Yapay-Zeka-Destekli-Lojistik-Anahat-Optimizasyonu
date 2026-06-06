@@ -40,3 +40,7 @@ Desktop.ini
 # === Yarışma Raporları ===
 # Önrapor PDF dosyası git geçmişinden silindiği için yerel klasörde bulunsa dahi tekrar track edilmemeli.
 *.pdf
+*.json
+tum_kodlar.txt
+.py
+
