@@ -2,6 +2,11 @@
 Streamlit + Folium Karar Destek Sistemi (KDS) Dashboard
 Person D: Sistem Mimarı ve Arayüz Geliştiricisi
 
+Timeout-Safe Mimari:
+  Dashboard → POST /api/optimize/start → job_id alır
+  Dashboard → GET /api/optimize/status/{job_id} → her 5 sn sorgular
+  OR-Tools 9 dk sürse bile HTTP bağlantısı kopmaz.
+
 Sayfalar:
 1. Genel Bakış — KPI kartları + maliyet pasta
 2. Rota Haritası — Folium interaktif harita
@@ -19,7 +24,7 @@ from streamlit_folium import st_folium
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
-import json,os
+import json, os, time
 from datetime import datetime, timedelta
 
 # ── Sayfa konfigürasyonu ──
@@ -32,6 +37,17 @@ st.set_page_config(
 
 API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
 
+# ── Session State defaults ──
+if "job_id" not in st.session_state:
+    st.session_state.job_id = None
+if "job_status" not in st.session_state:
+    st.session_state.job_status = None
+if "job_result" not in st.session_state:
+    st.session_state.job_result = None
+if "job_start_time" not in st.session_state:
+    st.session_state.job_start_time = None
+if "job_tarih" not in st.session_state:
+    st.session_state.job_tarih = None
 
 # ── Sidebar ──
 with st.sidebar:
@@ -87,24 +103,70 @@ def load_demand_data():
     except:
         return {"toplam_kayit": 0, "talepler": []}
 
-@st.cache_data(ttl=30)
-def run_optimization(tarih, sla, ellemcele, spot, filo):
+
+def start_optimization(tarih: str, time_limit: int = 540):
+    """
+    Kişi D — Timeout-Safe Optimizasyon Başlatıcı
+
+    POST /api/optimize/start ile arka planda iş başlatır.
+    job_id'yi session_state'e kaydeder.
+    HTTP timeout yok — istek anında döner.
+    """
     try:
         r = requests.post(
-            f"{API_BASE}/api/optimize",
-            json={
-                "tarih": tarih,
-                "hedef_filo_kullanim": filo,
-                "spot_limit": spot,
-                "sla_katsayi": sla,
-                "ellemcele_katsayi": ellemcele,
-            },
-            timeout=120,
+            f"{API_BASE}/api/optimize/start",
+            json={"tarih": tarih, "time_limit": time_limit},
+            timeout=30,  # Sadece iş başlatma — anında döner
         )
-        return r.json()
+        if r.status_code == 200:
+            data = r.json()
+            st.session_state.job_id = data["job_id"]
+            st.session_state.job_status = "pending"
+            st.session_state.job_result = None
+            st.session_state.job_start_time = time.time()
+            st.session_state.job_tarih = tarih
+            return True
+        else:
+            st.error(f"❌ API Hatası: {r.status_code} — {r.text}")
+            return False
+    except requests.exceptions.ConnectionError:
+        st.error("❌ API'ye bağlanılamıyor. Backend çalışıyor mu?")
+        return False
     except Exception as e:
-        st.error(f"Optimizasyon hatası: {e}")
+        st.error(f"❌ Bağlantı hatası: {e}")
+        return False
+
+
+def poll_optimization():
+    """
+    Kişi D — Job Durum Sorgulama
+
+    GET /api/optimize/status/{job_id} ile sonucu sorgular.
+    done → result'ı session_state'e kaydeder
+    running/pending → tekrar sorgulama gerekir
+    """
+    if not st.session_state.job_id:
         return None
+
+    try:
+        r = requests.get(
+            f"{API_BASE}/api/optimize/status/{st.session_state.job_id}",
+            timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            st.session_state.job_status = data["status"]
+
+            if data["status"] == "done":
+                st.session_state.job_result = data["result"]
+                return data["result"]
+            elif data["status"] == "error":
+                st.error(f"❌ Optimizasyon hatası: {data.get('error', 'Bilinmeyen hata')}")
+                return None
+        return None
+    except:
+        return None
+
 
 def get_tm_status(tarih):
     try:
@@ -141,10 +203,45 @@ if page == "Genel Bakış":
     
     tarih_str = planlama_tarihi.strftime("%Y-%m-%d")
     
-    with st.spinner("Optimizasyon çalıştırılıyor..."):
-        result = run_optimization(tarih_str, sla_katsayi, ellemcele_katsayi, spot_limit, filo_kullanim)
+    # ── Optimizasyon Kontrol Paneli ──
+    col_btn, col_status = st.columns([1, 3])
+    
+    with col_btn:
+        if st.button("🚀 Optimizasyonu Başlat", type="primary", use_container_width=True):
+            start_optimization(tarih_str)
+            st.rerun()
+    
+    with col_status:
+        if st.session_state.job_status in ("pending", "running"):
+            elapsed = time.time() - (st.session_state.job_start_time or time.time())
+            mins, secs = divmod(int(elapsed), 60)
+            
+            st.info(f"⏳ OR-Tools çalışıyor... **{mins}dk {secs}sn** | Job: `{st.session_state.job_id[:8]}...`")
+            
+            # Progress bar (9 dk = 540 sn maks)
+            progress = min(elapsed / 540.0, 0.99)
+            st.progress(progress, text=f"Tahmini ilerleme: %{int(progress * 100)}")
+            
+            # Durum sorgula
+            poll_optimization()
+            
+            if st.session_state.job_status in ("pending", "running"):
+                # 5 saniye sonra tekrar sorgula
+                time.sleep(5)
+                st.rerun()
+        
+        elif st.session_state.job_status == "done":
+            st.success("✅ Optimizasyon tamamlandı!")
+        
+        elif st.session_state.job_status == "error":
+            st.error("❌ Optimizasyon başarısız oldu.")
+    
+    # ── Sonuçları göster ──
+    result = st.session_state.job_result
     
     if result and result.get("solver_status"):
+        st.divider()
+        
         # KPI Kartları
         col1, col2, col3, col4 = st.columns(4)
         
@@ -189,8 +286,19 @@ if page == "Genel Bakış":
             fig_bar.update_layout(height=350)
             st.plotly_chart(fig_bar, use_container_width=True)
         
-        # Çalışma süresi
-        st.caption(f"⏱️ Optimizasyon süresi: {result.get('calisma_suresi_sn', 0):.3f} sn | Tarih: {tarih_str} | Durum: {result.get('solver_status', '?')}")
+        # Atanamayan talepler uyarısı
+        unassigned = result.get("unassigned_demand", {})
+        if unassigned:
+            st.divider()
+            st.subheader("⚠️ Atanamayan Talepler")
+            df_unassigned = pd.DataFrame([
+                {"Hat": k, "Kalan Talep (desi)": round(v, 1)}
+                for k, v in unassigned.items()
+            ]).sort_values("Kalan Talep (desi)", ascending=False)
+            st.dataframe(df_unassigned, use_container_width=True, hide_index=True)
+    
+    elif not st.session_state.job_id:
+        st.info("👆 Optimizasyonu başlatmak için butona tıklayın. OR-Tools çözümü 9 dakikaya kadar sürebilir — timeout olmadan bekler.")
 
 # ══════════════════════════════════════════════
 #  SAYFA 2: ROTA HARİTASI
@@ -199,11 +307,12 @@ if page == "Genel Bakış":
 elif page == "Rota Haritası":
     st.header("🗺️ Rota Haritası")
     
-    tarih_str = planlama_tarihi.strftime("%Y-%m-%d")
-    result = run_optimization(tarih_str, sla_katsayi, ellemcele_katsayi, spot_limit, filo_kullanim)
-    
+    result = st.session_state.job_result
     params = load_params()
     cities = {c["id"]: c for c in params.get("sehirler", [])}
+    
+    if not result:
+        st.warning("⚠️ Önce 'Genel Bakış' sayfasından optimizasyonu çalıştırın.")
     
     # Türkiye merkezli harita
     m = folium.Map(location=[39.0, 35.0], zoom_start=6, tiles="CartoDB positron")

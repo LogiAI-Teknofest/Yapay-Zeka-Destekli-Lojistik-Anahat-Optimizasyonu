@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
-import json, os, datetime, sys
+import json, os, datetime, sys, uuid, threading, time
 from pathlib import Path
 
 # Proje kök dizinini sys.path'e ekle (container içinde src/ doğrudan erişilebilir)
@@ -48,6 +48,14 @@ app.add_middleware(
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(_PROJECT_ROOT, "data", "raw"))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(_PROJECT_ROOT, "data", "processed"))
 INPUT_JSON = os.environ.get("INPUT_JSON", os.path.join(DATA_DIR, "logiai_mvp_input.json"))
+
+# ──────────────────────────────────────────────
+#  Async Job Store — Timeout-safe optimizasyon
+#  Kişi D: Uzun süren OR-Tools çözümlerini arka planda çalıştırır
+# ──────────────────────────────────────────────
+
+_job_store: dict[str, dict] = {}
+_job_lock = threading.Lock()
 
 # ──────────────────────────────────────────────
 #  Modeller (Pydantic) — Yeni pipeline çıktı şemasına uyumlu
@@ -293,6 +301,115 @@ def optimize(req: OptimizeRequest):
     result["calisma_suresi_sn"] = round(elapsed, 3)
 
     return result
+
+# ──────────────────────────────────────────────
+#  Async Optimize Endpoints (Kişi D — Timeout-Safe)
+#  Dashboard bu endpoint'leri kullanarak OR-Tools'un
+#  9 dk'ya kadar süren çözümlerini timeout olmadan alır.
+# ──────────────────────────────────────────────
+
+def _job_worker(job_id: str, data: dict, date: str, time_limit: int):
+    """Arka plan thread'inde pipeline çalıştırır."""
+    try:
+        with _job_lock:
+            _job_store[job_id]["status"] = "running"
+            _job_store[job_id]["started_at"] = datetime.datetime.now().isoformat()
+        
+        result = _run_pipeline(data, date, time_limit_sec=time_limit)
+        
+        with _job_lock:
+            _job_store[job_id]["status"] = "done"
+            _job_store[job_id]["result"] = result
+            _job_store[job_id]["finished_at"] = datetime.datetime.now().isoformat()
+    except Exception as e:
+        with _job_lock:
+            _job_store[job_id]["status"] = "error"
+            _job_store[job_id]["error"] = str(e)
+            _job_store[job_id]["finished_at"] = datetime.datetime.now().isoformat()
+
+
+@app.post("/api/optimize/start")
+def optimize_start(req: OptimizeRequest):
+    """
+    Kişi D — Asenkron Optimizasyon Başlatıcı
+
+    Pipeline'ı arka plan thread'inde çalıştırır ve hemen bir job_id döner.
+    Dashboard bu job_id ile /api/optimize/status/{job_id} üzerinden sonucu sorgular.
+    OR-Tools 9 dk sürse bile HTTP bağlantısı kopmaz.
+    """
+    # JSON girdi dosyasını yükle
+    if not os.path.exists(INPUT_JSON):
+        raise HTTPException(404, f"Girdi dosyası bulunamadı: {INPUT_JSON}")
+
+    try:
+        data = load_input(INPUT_JSON)
+    except DataContractError as e:
+        raise HTTPException(400, f"Veri sözleşmesi hatası: {e}")
+
+    # Tarih kontrolü
+    dates = available_dates(data)
+    if req.tarih not in dates:
+        raise HTTPException(
+            404,
+            f"{req.tarih} tarihi için talep verisi bulunamadı. "
+            f"Mevcut tarihler: {dates}"
+        )
+
+    # Job oluştur ve arka planda başlat
+    job_id = str(uuid.uuid4())
+    with _job_lock:
+        _job_store[job_id] = {
+            "status": "pending",
+            "tarih": req.tarih,
+            "time_limit": req.time_limit,
+            "created_at": datetime.datetime.now().isoformat(),
+            "result": None,
+            "error": None,
+        }
+
+    thread = threading.Thread(
+        target=_job_worker,
+        args=(job_id, data, req.tarih, req.time_limit),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"job_id": job_id, "status": "pending"}
+
+
+@app.get("/api/optimize/status/{job_id}")
+def optimize_status(job_id: str):
+    """
+    Kişi D — Job Durum Sorgulama
+
+    Dönen status değerleri:
+    - pending  : İş henüz başlamadı
+    - running  : OR-Tools çalışıyor
+    - done     : Sonuç hazır (result alanında)
+    - error    : Hata oluştu (error alanında)
+    """
+    with _job_lock:
+        job = _job_store.get(job_id)
+
+    if not job:
+        raise HTTPException(404, f"Job bulunamadı: {job_id}")
+
+    response = {
+        "job_id": job_id,
+        "status": job["status"],
+        "tarih": job.get("tarih"),
+        "created_at": job.get("created_at"),
+    }
+
+    if job["status"] == "done":
+        response["result"] = job["result"]
+        response["finished_at"] = job.get("finished_at")
+    elif job["status"] == "error":
+        response["error"] = job["error"]
+        response["finished_at"] = job.get("finished_at")
+
+    return response
+
 
 @app.get("/api/predict")
 def predict(
