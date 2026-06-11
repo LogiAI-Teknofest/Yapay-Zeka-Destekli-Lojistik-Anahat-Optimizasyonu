@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
 import json, os, datetime, sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # Proje kök dizinini sys.path'e ekle (container içinde src/ doğrudan erişilebilir)
@@ -29,6 +30,9 @@ from optimization.greedy import run_greedy_assignment
 from optimization.vrp_solver import run_spot_vrp
 from models.data_types import PipelineResult, RentalAssignment, SpotAssignment
 from utils.data_loader import load_input, available_dates, DataContractError
+from app.job_manager import create_job, set_running, set_completed, set_failed, get_job as _get_job
+
+_executor = ThreadPoolExecutor(max_workers=4)
 
 app = FastAPI(
     title="Lojistik Optimizasyon API",
@@ -487,6 +491,74 @@ def get_demand(
     if sehir:
         demand_data = [r for r in demand_data if r["gonderen_id"] == sehir or r["alan_id"] == sehir]
     return {"toplam_kayit": len(demand_data), "talepler": demand_data}
+
+
+# ──────────────────────────────────────────────
+#  Async Optimizasyon — Redis Polling
+# ──────────────────────────────────────────────
+
+class AsyncJobResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+@app.post("/api/optimize/async", response_model=AsyncJobResponse)
+def optimize_async(req: OptimizeRequest):
+    """
+    Optimizasyonu arka planda başlatır; arayüz kilitlenmez.
+
+    Hemen job_id döner. İstemci /api/jobs/{job_id} adresini
+    periyodik olarak sorgulayarak durumu takip eder.
+
+    İş durumları: PENDING → RUNNING → COMPLETED | FAILED
+    """
+    if not os.path.exists(INPUT_JSON):
+        raise HTTPException(404, f"Girdi dosyası bulunamadı: {INPUT_JSON}")
+
+    try:
+        data = load_input(INPUT_JSON)
+    except DataContractError as e:
+        raise HTTPException(400, f"Veri sözleşmesi hatası: {e}")
+
+    dates = available_dates(data)
+    if req.tarih not in dates:
+        raise HTTPException(
+            404,
+            f"{req.tarih} tarihi için talep verisi bulunamadı. "
+            f"Mevcut tarihler: {dates}",
+        )
+
+    job_id = create_job()
+
+    def _worker():
+        set_running(job_id)
+        try:
+            start = datetime.datetime.now()
+            result = _run_pipeline(data, req.tarih, time_limit_sec=req.time_limit)
+            elapsed = (datetime.datetime.now() - start).total_seconds()
+            result["calisma_suresi_sn"] = round(elapsed, 3)
+            set_completed(job_id, result)
+        except Exception as exc:
+            set_failed(job_id, str(exc))
+
+    _executor.submit(_worker)
+    return {"job_id": job_id, "status": "PENDING"}
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job_status(job_id: str):
+    """
+    İş durumunu döner.
+
+    Dönen alan "status": PENDING | RUNNING | COMPLETED | FAILED
+    COMPLETED ise "result" alanı OptimizeResponse şemasıyla aynıdır.
+    FAILED ise "error" alanı hata mesajını içerir.
+    """
+    job = _get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job bulunamadı veya süresi doldu (TTL: 1 saat).")
+    return job
+
 
 if __name__ == "__main__":
     import uvicorn
