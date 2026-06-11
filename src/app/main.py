@@ -3,26 +3,19 @@ FastAPI Gateway — Lojistik Optimizasyon Sistemi
 Person D: Sistem Mimarı ve Arayüz Geliştiricisi
 
 Modüller:
-- /api/optimize        → OR-Tools rota optimizasyonu (senkron)
-- /api/optimize/start  → Asenkron job başlatıcı (pending/running/done/error)
-- /api/optimize/status → Job durum sorgulama
-- /api/optimize/async  → Dashboard uyumlu async başlatıcı (PENDING/COMPLETED/FAILED)
-- /api/jobs/{job_id}   → Dashboard uyumlu job sorgulama (TTL: 1 saat)
-- /api/optimize/stream → SSE gerçek zamanlı akış
-- /api/predict         → LSTM talep tahmini (placeholder)
-- /api/fleet           → Filo atama durumu
-- /api/tm-status       → Transfer merkezi kapasite izleme
-- /api/excel           → Excel çıktı üretimi
+- /api/optimize  → OR-Tools rota optimizasyonu
+- /api/predict   → LSTM talep tahmini (placeholder)
+- /api/fleet     → Filo atama durumu
+- /api/tm-status → Transfer merkezi kapasite izleme
+- /api/excel     → Excel çıktı üretimi
 """
 
- 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query
-from fastapi.responses import StreamingResponse
- 
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
-import json, os, datetime, sys, uuid, threading, time
+import json, os, datetime, sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # Proje kök dizinini sys.path'e ekle (container içinde src/ doğrudan erişilebilir)
@@ -37,6 +30,9 @@ from optimization.greedy import run_greedy_assignment
 from optimization.vrp_solver import run_spot_vrp
 from models.data_types import PipelineResult, RentalAssignment, SpotAssignment
 from utils.data_loader import load_input, available_dates, DataContractError
+from app.job_manager import create_job, set_running, set_completed, set_failed, get_job as _get_job, get_job_for_date as _get_job_for_date
+
+_executor = ThreadPoolExecutor(max_workers=4)
 
 app = FastAPI(
     title="Lojistik Optimizasyon API",
@@ -56,14 +52,6 @@ app.add_middleware(
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(_PROJECT_ROOT, "data", "raw"))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(_PROJECT_ROOT, "data", "processed"))
 INPUT_JSON = os.environ.get("INPUT_JSON", os.path.join(DATA_DIR, "logiai_mvp_input.json"))
-
-# ──────────────────────────────────────────────
-#  Async Job Store — Timeout-safe optimizasyon
-#  Kişi D: Uzun süren OR-Tools çözümlerini arka planda çalıştırır
-# ──────────────────────────────────────────────
-
-_job_store: dict[str, dict] = {}
-_job_lock = threading.Lock()
 
 # ──────────────────────────────────────────────
 #  Modeller (Pydantic) — Yeni pipeline çıktı şemasına uyumlu
@@ -126,47 +114,66 @@ class FleetVehicle(BaseModel):
 #  Yardımcı Fonksiyonlar
 # ──────────────────────────────────────────────
 
+_COORDS_XLSX = os.path.join(DATA_DIR, "Koordinatlar v2.xlsx")
+_CITY_COORDS_CACHE: dict[str, dict] | None = None
+
+
+def _load_city_coords() -> dict[str, dict]:
+    """Koordinatlar v2.xlsx'ten şehir koordinatlarını okur; sonucu önbelleğe alır."""
+    global _CITY_COORDS_CACHE
+    if _CITY_COORDS_CACHE is not None:
+        return _CITY_COORDS_CACHE
+    coords: dict[str, dict] = {}
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(_COORDS_XLSX)
+        ws = wb.active
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            city, lat, lon = row[0], row[1], row[2]
+            if city and lat is not None and lon is not None:
+                coords[str(city)] = {"lat": float(lat), "lon": float(lon)}
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("Koordinat dosyası okunamadı: %s", e)
+    _CITY_COORDS_CACHE = coords
+    return coords
+
+
 def load_params():
     with open(os.path.join(DATA_DIR, "parameters.json"), "r") as f:
         return json.load(f)
 
 def load_demand():
-    import csv
+    """daily_demand'ı düz liste formatına çevirir (günlük_talep.csv uyumu)."""
+    data = load_input(INPUT_JSON)
+    daily_demand = data.get("daily_demand", {})
+    dates_sorted = sorted(daily_demand.keys())
     rows = []
-    path = os.path.join(DATA_DIR, "gunluk_talep.csv")
-    with open(path, "r") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
+    for day_idx, tarih in enumerate(dates_sorted, 1):
+        for origin, dests in daily_demand[tarih].items():
+            for dest, desi in dests.items():
+                if float(desi) > 0:
+                    rows.append({
+                        "tarih": tarih,
+                        "gonderen_id": origin,
+                        "alan_id": dest,
+                        "talep_desi": str(int(float(desi))),
+                        "gun": str(day_idx),
+                    })
     return rows
 
 def load_distance_matrix():
-    import csv
-    path = os.path.join(DATA_DIR, "mesafe_matrisi.csv")
-    with open(path, "r") as f:
-        reader = csv.reader(f)
-        header = next(reader)
-        matrix = {}
-        for row in reader:
-            city = row[0]
-            matrix[city] = {}
-            for i, val in enumerate(row[1:], 1):
-                matrix[city][header[i]] = float(val)
-    return matrix
+    """logiai_mvp_input.json'dan mesafe matrisini döner."""
+    data = load_input(INPUT_JSON)
+    return data.get("distance_matrix", {})
 
 def load_travel_time_matrix():
-    import csv
-    path = os.path.join(DATA_DIR, "seyahat_suresi_saat.csv")
-    with open(path, "r") as f:
-        reader = csv.reader(f)
-        header = next(reader)
-        matrix = {}
-        for row in reader:
-            city = row[0]
-            matrix[city] = {}
-            for i, val in enumerate(row[1:], 1):
-                matrix[city][header[i]] = float(val)
-    return matrix
+    """Seyahat süresi matrisini mesafeden türetir (ort. 80 km/saat)."""
+    dist = load_distance_matrix()
+    return {
+        origin: {dest: round(km / 80.0, 2) for dest, km in dests.items()}
+        for origin, dests in dist.items()
+    }
 
 def get_demand_for_date(demand_data, date_str):
     """Tarihe ait talepleri filtrele"""
@@ -310,283 +317,6 @@ def optimize(req: OptimizeRequest):
 
     return result
 
-# ──────────────────────────────────────────────
-#  Async Optimize Endpoints (Kişi D — Timeout-Safe)
-#  Dashboard bu endpoint'leri kullanarak OR-Tools'un
-#  9 dk'ya kadar süren çözümlerini timeout olmadan alır.
-# ──────────────────────────────────────────────
-
-def _job_worker(job_id: str, data: dict, date: str, time_limit: int):
-    """Arka plan thread'inde pipeline çalıştırır."""
-    try:
-        with _job_lock:
-            _job_store[job_id]["status"] = "running"
-            _job_store[job_id]["started_at"] = datetime.datetime.now().isoformat()
-        
-        result = _run_pipeline(data, date, time_limit_sec=time_limit)
-        
-        with _job_lock:
-            _job_store[job_id]["status"] = "done"
-            _job_store[job_id]["result"] = result
-            _job_store[job_id]["finished_at"] = datetime.datetime.now().isoformat()
-    except Exception as e:
-        with _job_lock:
-            _job_store[job_id]["status"] = "error"
-            _job_store[job_id]["error"] = str(e)
-            _job_store[job_id]["finished_at"] = datetime.datetime.now().isoformat()
-
-
-@app.post("/api/optimize/start")
-def optimize_start(req: OptimizeRequest):
-    """
-    Kişi D — Asenkron Optimizasyon Başlatıcı
-
-    Pipeline'ı arka plan thread'inde çalıştırır ve hemen bir job_id döner.
-    Dashboard bu job_id ile /api/optimize/status/{job_id} üzerinden sonucu sorgular.
-    OR-Tools 9 dk sürse bile HTTP bağlantısı kopmaz.
-    """
-    # JSON girdi dosyasını yükle
-    if not os.path.exists(INPUT_JSON):
-        raise HTTPException(404, f"Girdi dosyası bulunamadı: {INPUT_JSON}")
-
-    try:
-        data = load_input(INPUT_JSON)
-    except DataContractError as e:
-        raise HTTPException(400, f"Veri sözleşmesi hatası: {e}")
-
-    # Tarih kontrolü
-    dates = available_dates(data)
-    if req.tarih not in dates:
-        raise HTTPException(
-            404,
-            f"{req.tarih} tarihi için talep verisi bulunamadı. "
-            f"Mevcut tarihler: {dates}"
-        )
-
-    # Job oluştur ve arka planda başlat
-    job_id = str(uuid.uuid4())
-    with _job_lock:
-        _job_store[job_id] = {
-            "status": "pending",
-            "tarih": req.tarih,
-            "time_limit": req.time_limit,
-            "created_at": datetime.datetime.now().isoformat(),
-            "result": None,
-            "error": None,
-        }
-
-    thread = threading.Thread(
-        target=_job_worker,
-        args=(job_id, data, req.tarih, req.time_limit),
-        daemon=True,
-    )
-    thread.start()
-
-    return {"job_id": job_id, "status": "pending"}
-
-
-@app.get("/api/optimize/status/{job_id}")
-def optimize_status(job_id: str):
-    """
-    Kişi D — Job Durum Sorgulama
-
-    Dönen status değerleri:
-    - pending  : İş henüz başlamadı
-    - running  : OR-Tools çalışıyor
-    - done     : Sonuç hazır (result alanında)
-    - error    : Hata oluştu (error alanında)
-    """
-    with _job_lock:
-        job = _job_store.get(job_id)
-
-    if not job:
-        raise HTTPException(404, f"Job bulunamadı: {job_id}")
-
-    response = {
-        "job_id": job_id,
-        "status": job["status"],
-        "tarih": job.get("tarih"),
-        "created_at": job.get("created_at"),
-    }
-
-    if job["status"] == "done":
-        response["result"] = job["result"]
-        response["finished_at"] = job.get("finished_at")
-    elif job["status"] == "error":
-        response["error"] = job["error"]
-        response["finished_at"] = job.get("finished_at")
-
-    return response
-
-
-# ──────────────────────────────────────────────
-#  Async Endpoints — Dashboard Uyumluluk Katmanı
-#  POST /api/optimize/async  →  job_id döner (PENDING/RUNNING/COMPLETED/FAILED)
-#  GET  /api/jobs/{job_id}   →  job durumu + sonuç
-#  Bu endpoint'ler _job_store'u paylaşır; SSE endpoint'inden bağımsız tüketilebilir.
-# ──────────────────────────────────────────────
-
-class AsyncJobResponse(BaseModel):
-    job_id: str
-    status: str
-
-
-@app.post("/api/optimize/async", response_model=AsyncJobResponse)
-def optimize_async(req: OptimizeRequest):
-    """
-    Dashboard Uyumlu Asenkron Optimizasyon Başlatıcı
-
-    /api/optimize/start ile aynı mantığı kullanır ancak status değerleri
-    dashboard'un beklediği büyük harf formatındadır:
-    PENDING → RUNNING → COMPLETED | FAILED
-    """
-    if not os.path.exists(INPUT_JSON):
-        raise HTTPException(404, f"Girdi dosyası bulunamadı: {INPUT_JSON}")
-
-    try:
-        data = load_input(INPUT_JSON)
-    except DataContractError as e:
-        raise HTTPException(400, f"Veri sözleşmesi hatası: {e}")
-
-    dates = available_dates(data)
-    if req.tarih not in dates:
-        raise HTTPException(
-            404,
-            f"{req.tarih} tarihi için talep verisi bulunamadı. "
-            f"Mevcut tarihler: {dates}"
-        )
-
-    job_id = str(uuid.uuid4())
-    with _job_lock:
-        _job_store[job_id] = {
-            "status": "PENDING",
-            "tarih": req.tarih,
-            "time_limit": req.time_limit,
-            "created_at": datetime.datetime.now().isoformat(),
-            "started_at": None,
-            "result": None,
-            "error": None,
-        }
-
-    def _async_worker(jid: str, d: dict, date: str, tl: int):
-        with _job_lock:
-            _job_store[jid]["status"] = "RUNNING"
-            _job_store[jid]["started_at"] = datetime.datetime.now().isoformat()
-        try:
-            res = _run_pipeline(d, date, time_limit_sec=tl)
-            with _job_lock:
-                _job_store[jid]["status"] = "COMPLETED"
-                _job_store[jid]["result"] = res
-                _job_store[jid]["finished_at"] = datetime.datetime.now().isoformat()
-        except Exception as exc:
-            with _job_lock:
-                _job_store[jid]["status"] = "FAILED"
-                _job_store[jid]["error"] = str(exc)
-                _job_store[jid]["finished_at"] = datetime.datetime.now().isoformat()
-
-    threading.Thread(
-        target=_async_worker,
-        args=(job_id, data, req.tarih, req.time_limit),
-        daemon=True,
-    ).start()
-
-    return {"job_id": job_id, "status": "PENDING"}
-
-
-@app.get("/api/jobs/{job_id}")
-def get_job(job_id: str):
-    """
-    Dashboard Uyumlu Job Durum Sorgulama
-
-    Dönen status değerleri: PENDING | RUNNING | COMPLETED | FAILED
-    COMPLETED durumunda 'result' alanında optimizasyon sonucu bulunur.
-    Job 1 saatten eski ise 404 döner (TTL: 1 saat).
-    """
-    with _job_lock:
-        job = _job_store.get(job_id)
-
-    if not job:
-        raise HTTPException(404, "Job bulunamadı veya süresi doldu (TTL: 1 saat).")
-
-    # TTL kontrolü — 1 saatten eski job'ları kaldır
-    created = datetime.datetime.fromisoformat(job["created_at"])
-    if (datetime.datetime.now() - created).total_seconds() > 3600:
-        with _job_lock:
-            _job_store.pop(job_id, None)
-        raise HTTPException(404, "Job süresi doldu (TTL: 1 saat).")
-
-    response: dict = {
-        "job_id": job_id,
-        "status": job["status"],
-        "tarih": job.get("tarih"),
-        "created_at": job.get("created_at"),
-        "started_at": job.get("started_at"),
-    }
-    if job["status"] == "COMPLETED":
-        response["result"] = job["result"]
-        response["finished_at"] = job.get("finished_at")
-    elif job["status"] == "FAILED":
-        response["error"] = job.get("error")
-        response["finished_at"] = job.get("finished_at")
-
-    return response
-
-
-@app.post("/api/optimize/stream")
-def optimize_stream(req: OptimizeRequest):
-    """SSE endpoint — sonuç hazır olana kadar event akışı gönderir."""
-
-    # 1) Girdi doğrulama (mevcut koddaki gibi)
-    data = load_input(INPUT_JSON)
-    dates = available_dates(data)
-    if req.tarih not in dates:
-        raise HTTPException(404, "Tarih bulunamadı")
-
-    # 2) Event generator — pipeline'ı thread'de çalıştırır
-    def event_generator():
-        result_holder = {}
-        error_holder = {}
-        start_time = time.time()
-
-        # Pipeline'ı arka plan thread'inde başlat
-        def worker():
-            try:
-                result_holder["data"] = _run_pipeline(
-                    data, req.tarih, req.time_limit
-                )
-            except Exception as e:
-                error_holder["msg"] = str(e)
-
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-
-        # Thread çalışırken her 5 sn'de heartbeat gönder
-        while t.is_alive():
-            elapsed = round(time.time() - start_time, 1)
-            event = {"status": "running", "elapsed": elapsed}
-            yield f"data: {json.dumps(event)}\n\n"
-            time.sleep(5)  # 5 sn bekle
-
-        # Thread bitti — sonucu veya hatayı gönder
-        elapsed = round(time.time() - start_time, 1)
-        if error_holder:
-            event = {"status": "error", "error": error_holder["msg"], "elapsed": elapsed}
-        else:
-            event = {"status": "done", "result": result_holder["data"], "elapsed": elapsed}
-
-        yield f"data: {json.dumps(event)}\n\n"
-
-    # 3) StreamingResponse ile SSE döndür
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # nginx proxy varsa buffering kapatır
-        },
-    )
-
-
 @app.get("/api/predict")
 def predict(
     tarih: str = Query(..., description="Tahmin tarihi (YYYY-MM-DD)"),
@@ -625,55 +355,88 @@ def predict(
     return {"tarih": tarih, "tahminler": predictions}
 
 @app.get("/api/fleet", response_model=list[FleetVehicle])
-def fleet_status():
-    """Kiralık filo durum raporu"""
-    params = load_params()
+def fleet_status(tarih: Optional[str] = Query(None)):
+    """Kiralık filo durum raporu. tarih verilirse Redis'ten gerçek doluluk oranı döner."""
+    data = load_input(INPUT_JSON)
+
+    # Tarih için tamamlanmış job varsa vehicle_id → utilisation map'i kur
+    utilisation_map: dict[str, float] = {}
+    if tarih:
+        job = _get_job_for_date(tarih)
+        if job and job.get("status") == "COMPLETED":
+            for a in job["result"].get("rental_assignments", []):
+                vid = a["vehicle_id"]
+                # Aynı araç birden fazla atamada olabilir; toplamı kapat 1.0'da
+                utilisation_map[vid] = min(
+                    utilisation_map.get(vid, 0.0) + a["utilisation"], 1.0
+                )
+
     result = []
-    for v in params["kirali_filo"]:
-        result.append(FleetVehicle(
-            arac_id=v["arac_id"],
-            tip=v["tip"],
-            sabit_gunluk=v["sabit_gunluk"],
-            aktif=True,
-            rota=", ".join(v["rotalar"]),
-        ))
+    for route_key, vehicles in data.get("rental_routes", {}).items():
+        origin, dest = route_key.split("_", 1)
+        for v in vehicles:
+            vid = v["id"]
+            vtype = v.get("vehicle_type", "Tır")
+            cost_row = data.get("cost_matrix", {}).get(origin, {}).get(dest, {}).get(vtype, {})
+            sabit = float(cost_row.get("kiralık", 0) or cost_row.get("kiralik", 0))
+            result.append(FleetVehicle(
+                arac_id=vid,
+                tip=vtype,
+                sabit_gunluk=sabit,
+                aktif=True,
+                rota=f"{origin}→{dest}",
+                doluluk_pct=round(utilisation_map.get(vid, 0.0) * 100, 1),
+            ))
     return result
 
 @app.get("/api/tm-status", response_model=list[TMDurum])
 def tm_status(tarih: Optional[str] = Query(None)):
-    """Transfer merkezi kapasite izleme"""
-    params = load_params()
-    demand_data = load_demand()
-    
+    """Transfer merkezi kapasite izleme — logiai_mvp_input.json'dan türetilir."""
+    data = load_input(INPUT_JSON)
+    daily_demand = data.get("daily_demand", {})
+
     target_date = tarih or datetime.datetime.now().strftime("%Y-%m-%d")
-    date_demands = get_demand_for_date(demand_data, target_date)
+
+    # Her şehir için tüm tarihler üzerinden maksimum akışı kapasite tahmini olarak kullan
+    city_max_flow: dict[str, float] = {}
+    for date, origins in daily_demand.items():
+        day_flow: dict[str, float] = {}
+        for origin, dests in origins.items():
+            for dest, desi in dests.items():
+                day_flow[origin] = day_flow.get(origin, 0.0) + float(desi)
+                day_flow[dest]   = day_flow.get(dest,   0.0) + float(desi)
+        for city, flow in day_flow.items():
+            if flow > city_max_flow.get(city, 0.0):
+                city_max_flow[city] = flow
+
+    # Seçili tarihteki akış
+    date_flow: dict[str, float] = {}
+    for origin, dests in daily_demand.get(target_date, {}).items():
+        for dest, desi in dests.items():
+            date_flow[origin] = date_flow.get(origin, 0.0) + float(desi)
+            date_flow[dest]   = date_flow.get(dest,   0.0) + float(desi)
 
     result = []
-    for c in params["sehirler"]:
-        if not c.get("tm_var"):
-            continue
-        total_flow = sum(
-            int(r["talep_desi"])
-            for r in date_demands
-            if r["gonderen_id"] == c["id"] or r["alan_id"] == c["id"]
-        )
-        kapasite = c["tm_kapasite"]
-        asim = max(0, total_flow - kapasite)
+    for city in sorted(city_max_flow.keys()):
+        kapasite = int(city_max_flow[city] * 1.5)  # %50 tampon
+        yuk      = int(date_flow.get(city, 0.0))
+        asim     = max(0, yuk - kapasite)
         result.append(TMDurum(
-            tm_id=c["id"],
-            tm_ad=c["ad"],
+            tm_id=city[:4].upper().replace("İ", "I").replace("Ş", "S").replace("Ç", "C").replace("Ğ", "G").replace("Ü", "U").replace("Ö", "O"),
+            tm_ad=city,
             kapasite=kapasite,
-            yuk=total_flow,
+            yuk=yuk,
             asim=asim,
             asim_maliyet=round(asim * 8.0, 2),
         ))
     return result
 
-@app.post("/api/excel")
+@app.get("/api/excel")
 def generate_excel(tarih: str = Query(...)):
     """Optimizasyon sonuçlarını Excel olarak oluştur"""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
+    from fastapi.responses import FileResponse
 
     params = load_params()
     demand_data = load_demand()
@@ -697,26 +460,32 @@ def generate_excel(tarih: str = Query(...)):
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
 
+    mvp_data    = load_input(INPUT_JSON)
+    dist_matrix = load_distance_matrix()
+    time_matrix = load_travel_time_matrix()
     row_idx = 2
-    for v in params["kirali_filo"]:
-        for rota in v["rotalar"]:
-            src, dst = rota.split("-")
-            tip_info = next(t for t in params["arac_tipleri"] if t["id"] == v["tip"])
-            demand_val = next((int(r["talep_desi"]) for r in date_demands
-                              if r["gonderen_id"] == src and r["alan_id"] == dst), 0)
-            if demand_val == 0:
-                continue
-            dist_matrix = load_distance_matrix()
-            time_matrix = load_travel_time_matrix()
-            ws1.cell(row=row_idx, column=1, value=v["arac_id"])
-            ws1.cell(row=row_idx, column=2, value="Kiralık " + v["tip"])
-            ws1.cell(row=row_idx, column=3, value=rota)
+    total_fixed = 0
+    for route_key, vehicles in mvp_data.get("rental_routes", {}).items():
+        src, dst = route_key.split("_", 1)
+        demand_val = next(
+            (int(r["talep_desi"]) for r in date_demands
+             if r["gonderen_id"] == src and r["alan_id"] == dst), 0
+        )
+        for v in vehicles:
+            vtype = v.get("vehicle_type", "Tır")
+            cap   = float(v.get("capacity_desi", 0))
+            cost_row = mvp_data.get("cost_matrix", {}).get(src, {}).get(dst, {}).get(vtype, {})
+            sabit = float(cost_row.get("kiralık", 0) or cost_row.get("kiralik", 0))
+            total_fixed += sabit
+            ws1.cell(row=row_idx, column=1, value=v["id"])
+            ws1.cell(row=row_idx, column=2, value="Kiralık " + vtype)
+            ws1.cell(row=row_idx, column=3, value=f"{src}-{dst}")
             ws1.cell(row=row_idx, column=4, value=src)
             ws1.cell(row=row_idx, column=5, value=dst)
-            ws1.cell(row=row_idx, column=6, value=min(demand_val, tip_info["kapasite_desi"]))
+            ws1.cell(row=row_idx, column=6, value=min(demand_val, cap))
             ws1.cell(row=row_idx, column=7, value=dist_matrix.get(src, {}).get(dst, 0))
             ws1.cell(row=row_idx, column=8, value=time_matrix.get(src, {}).get(dst, 0))
-            ws1.cell(row=row_idx, column=9, value=v["sabit_gunluk"])
+            ws1.cell(row=row_idx, column=9, value=sabit)
             row_idx += 1
 
     # ── Sayfa 2: Talep Özeti ──
@@ -741,7 +510,6 @@ def generate_excel(tarih: str = Query(...)):
         cell.font = header_font
         cell.fill = header_fill
 
-    total_fixed = sum(v["sabit_gunluk"] for v in params["kirali_filo"])
     ws3.cell(row=2, column=1, value="Kiralık Filo Sabit")
     ws3.cell(row=2, column=2, value=total_fixed)
     ws3.cell(row=3, column=1, value="Spot Araç Değişken")
@@ -754,13 +522,26 @@ def generate_excel(tarih: str = Query(...)):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     wb.save(output_path)
 
-    return {"status": "created", "dosya": output_path, "tarih": tarih}
+    return FileResponse(output_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=f"rapor_{tarih}.xlsx")
 
 @app.get("/api/cities")
 def list_cities():
-    """Tüm şehir ve TM bilgisi"""
-    params = load_params()
-    return {"sehirler": params["sehirler"]}
+    """Tüm şehir ve TM bilgisi — koordinatlar Koordinatlar v2.xlsx'ten okunur."""
+    data = load_input(INPUT_JSON)
+    coords_map = _load_city_coords()
+    cities = []
+    for city_name in sorted(data["distance_matrix"].keys()):
+        coords = coords_map.get(city_name, {"lat": 39.0, "lon": 35.0})
+        cities.append({
+            "id":          city_name,
+            "ad":          city_name,
+            "lat":         coords["lat"],
+            "lon":         coords["lon"],
+            "tm_var":      True,
+            "tm_kapasite": 500000,
+            "tir_yanasma": True,
+        })
+    return {"sehirler": cities}
 
 @app.get("/api/vehicles")
 def list_vehicles():
@@ -781,7 +562,74 @@ def get_demand(
         demand_data = [r for r in demand_data if r["gonderen_id"] == sehir or r["alan_id"] == sehir]
     return {"toplam_kayit": len(demand_data), "talepler": demand_data}
 
+
+# ──────────────────────────────────────────────
+#  Async Optimizasyon — Redis Polling
+# ──────────────────────────────────────────────
+
+class AsyncJobResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+@app.post("/api/optimize/async", response_model=AsyncJobResponse)
+def optimize_async(req: OptimizeRequest):
+    """
+    Optimizasyonu arka planda başlatır; arayüz kilitlenmez.
+
+    Hemen job_id döner. İstemci /api/jobs/{job_id} adresini
+    periyodik olarak sorgulayarak durumu takip eder.
+
+    İş durumları: PENDING → RUNNING → COMPLETED | FAILED
+    """
+    if not os.path.exists(INPUT_JSON):
+        raise HTTPException(404, f"Girdi dosyası bulunamadı: {INPUT_JSON}")
+
+    try:
+        data = load_input(INPUT_JSON)
+    except DataContractError as e:
+        raise HTTPException(400, f"Veri sözleşmesi hatası: {e}")
+
+    dates = available_dates(data)
+    if req.tarih not in dates:
+        raise HTTPException(
+            404,
+            f"{req.tarih} tarihi için talep verisi bulunamadı. "
+            f"Mevcut tarihler: {dates}",
+        )
+
+    job_id = create_job()
+
+    def _worker():
+        set_running(job_id)
+        try:
+            start = datetime.datetime.now()
+            result = _run_pipeline(data, req.tarih, time_limit_sec=req.time_limit)
+            elapsed = (datetime.datetime.now() - start).total_seconds()
+            result["calisma_suresi_sn"] = round(elapsed, 3)
+            set_completed(job_id, result)
+        except Exception as exc:
+            set_failed(job_id, str(exc))
+
+    _executor.submit(_worker)
+    return {"job_id": job_id, "status": "PENDING"}
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job_status(job_id: str):
+    """
+    İş durumunu döner.
+
+    Dönen alan "status": PENDING | RUNNING | COMPLETED | FAILED
+    COMPLETED ise "result" alanı OptimizeResponse şemasıyla aynıdır.
+    FAILED ise "error" alanı hata mesajını içerir.
+    """
+    job = _get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job bulunamadı veya süresi doldu (TTL: 1 saat).")
+    return job
+
+
 if __name__ == "__main__":
-     
     import uvicorn
-    uvicorn.run(app, host="[IP_ADDRESS]", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -18,7 +18,8 @@ import redis
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
-_JOB_PREFIX = "logiai:job:"
+_JOB_PREFIX  = "logiai:job:"
+_DATE_PREFIX = "logiai:date:"
 _JOB_TTL = 3600
 
 
@@ -66,6 +67,10 @@ def set_running(job_id: str) -> None:
 
 def set_completed(job_id: str, result: dict) -> None:
     _patch(job_id, {"status": "COMPLETED", "finished_at": _now(), "result": result})
+    # Tarih → job_id indexi: /api/fleet gibi endpoint'ler tarihe göre sonucu bulabilsin
+    date = result.get("date")
+    if date:
+        _client().setex(f"{_DATE_PREFIX}{date}", _JOB_TTL, job_id)
 
 
 def set_failed(job_id: str, error: str) -> None:
@@ -77,3 +82,11 @@ def set_failed(job_id: str, error: str) -> None:
 def get_job(job_id: str) -> dict | None:
     raw = _client().get(f"{_JOB_PREFIX}{job_id}")
     return json.loads(raw) if raw else None
+
+
+def get_job_for_date(date: str) -> dict | None:
+    """Verilen tarih için en son tamamlanmış job'u döner."""
+    job_id = _client().get(f"{_DATE_PREFIX}{date}")
+    if not job_id:
+        return None
+    return get_job(job_id)

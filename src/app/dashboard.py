@@ -19,7 +19,7 @@ from streamlit_folium import st_folium
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
-import json, os
+import json, os, time
 from datetime import datetime, timedelta
 
 # ── Sayfa konfigürasyonu ──
@@ -87,56 +87,83 @@ def load_demand_data():
     except:
         return {"toplam_kayit": 0, "talepler": []}
 
-def get_optimization_result_sse(tarih: str, time_limit: int = 540) -> dict | None:
+def _submit_optimization_job(tarih: str) -> str | None:
+    """Arka planda optimizasyon başlatır, job_id döner."""
+    try:
+        r = requests.post(
+            f"{API_BASE}/api/optimize/async",
+            json={"tarih": tarih},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()["job_id"]
+    except Exception as e:
+        st.error(f"İş gönderme hatası: {e}")
+        return None
+
+
+def _poll_job(job_id: str) -> dict | None:
+    """Job durumunu bir kez sorgular."""
+    try:
+        r = requests.get(f"{API_BASE}/api/jobs/{job_id}", timeout=5)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def get_optimization_result(tarih: str) -> dict | None:
     """
-    SSE tabanlı optimizasyon yükleyici.
+    Redis polling ile optimizasyon sonucunu döner.
 
     - Aynı tarih için önceden alınmış sonuç session_state'te varsa anında döner.
-    - Yoksa /api/optimize/stream SSE akışını tüketir:
-        • Her 5 sn'de gelen "running" eventi ilerleme göstergesi olarak gösterilir.
-        • "done" eventi gelince sonucu döner ve önbelleğe alır.
-        • "error" eventi veya bağlantı hatasında hata gösterilip None döner.
+    - Devam eden bir job varsa polling yapar, UI rerun ile güncellenir.
+    - Hiç job yoksa yeni job başlatır.
     """
     cache_key = f"opt_result_{tarih}"
+    job_key = f"opt_job_{tarih}"
 
     # Önbellekte hazır sonuç var mı?
     if st.session_state.get(cache_key):
         return st.session_state[cache_key]
 
-    # SSE akışını tüket
-    status_placeholder = st.empty()
-    try:
-        with requests.post(
-            f"{API_BASE}/api/optimize/stream",
-            json={"tarih": tarih, "time_limit": time_limit},
-            stream=True,
-            timeout=(10, 700),  # bağlantı 10 sn, okuma 700 sn (9 dk OR-Tools limiti için)
-        ) as resp:
-            resp.raise_for_status()
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "):
-                    continue
-                event = json.loads(line[6:])
-                if event["status"] == "running":
-                    elapsed = event.get("elapsed", 0)
-                    status_placeholder.info(f"⏳ Optimizasyon çalışıyor... ({elapsed} sn)")
-                elif event["status"] == "done":
-                    status_placeholder.empty()
-                    result = event["result"]
-                    st.session_state[cache_key] = result
-                    return result
-                elif event["status"] == "error":
-                    status_placeholder.empty()
-                    st.error(f"❌ Optimizasyon hatası: {event.get('error', '?')}")
-                    return None
-    except Exception as e:
-        status_placeholder.empty()
-        st.error(f"🔌 SSE bağlantı hatası: {e}")
+    # Devam eden job var mı?
+    job_id = st.session_state.get(job_key)
+    if job_id:
+        job = _poll_job(job_id)
+        if job is None:
+            st.warning("Job durumu alınamadı, yeniden deneniyor...")
+            time.sleep(2)
+            st.rerun()
+            return None
+        if job["status"] == "COMPLETED":
+            st.session_state[cache_key] = job["result"]
+            del st.session_state[job_key]
+            return job["result"]
+        if job["status"] == "FAILED":
+            st.error(f"Optimizasyon başarısız: {job.get('error', '?')}")
+            del st.session_state[job_key]
+            return None
+        # PENDING veya RUNNING — bekle ve yeniden çalıştır
+        elapsed = ""
+        if job.get("started_at"):
+            secs = (datetime.utcnow() - datetime.fromisoformat(
+                job["started_at"].replace("Z", "+00:00").replace("+00:00", "")
+            )).seconds
+            elapsed = f" (~{secs} sn)"
+        st.info(f"⏳ Optimizasyon çalışıyor{elapsed}... (durum: {job['status']})")
+        time.sleep(2)
+        st.rerun()
         return None
 
+    # Henüz job yok — yeni job başlat
+    new_job_id = _submit_optimization_job(tarih)
+    if new_job_id:
+        st.session_state[job_key] = new_job_id
+        st.info("⏳ Optimizasyon başlatıldı...")
+        time.sleep(1)
+        st.rerun()
     return None
-
-
 
 def get_tm_status(tarih):
     try:
@@ -145,9 +172,10 @@ def get_tm_status(tarih):
     except:
         return []
 
-def get_fleet():
+def get_fleet(tarih: str | None = None):
     try:
-        r = requests.get(f"{API_BASE}/api/fleet")
+        params = {"tarih": tarih} if tarih else {}
+        r = requests.get(f"{API_BASE}/api/fleet", params=params)
         return r.json()
     except:
         return []
@@ -172,7 +200,7 @@ if page == "Genel Bakış":
     st.header("📊 Genel Bakış")
 
     tarih_str = planlama_tarihi.strftime("%Y-%m-%d")
-    result = get_optimization_result_sse(tarih_str)
+    result = get_optimization_result(tarih_str)
     
     if result and result.get("solver_status"):
         # KPI Kartları
@@ -230,7 +258,7 @@ elif page == "Rota Haritası":
     st.header("🗺️ Rota Haritası")
 
     tarih_str = planlama_tarihi.strftime("%Y-%m-%d")
-    result = get_optimization_result_sse(tarih_str)
+    result = get_optimization_result(tarih_str)
     
     params = load_params()
     cities = {c["id"]: c for c in params.get("sehirler", [])}
@@ -338,8 +366,9 @@ elif page == "Transfer Merkezleri":
 
 elif page == "Filo Yönetimi":
     st.header("🚛 Filo Yönetimi")
-    
-    fleet = get_fleet()
+
+    tarih_str = planlama_tarihi.strftime("%Y-%m-%d")
+    fleet = get_fleet(tarih_str)
     
     if fleet:
         col1, col2 = st.columns(2)
@@ -419,6 +448,7 @@ elif page == "Talep Analizi":
         ).reset_index()
         fig_weekly = px.bar(weekly, x="gun_ad", y="talep_desi",
                           title="Gün Ortalaması Talep", color="gun_ad")
+        fig_weekly.update_layout(xaxis_title="", legend_title="")
         st.plotly_chart(fig_weekly, use_container_width=True)
 
 # ══════════════════════════════════════════════
@@ -432,20 +462,20 @@ elif page == "Excel Rapor":
     
     st.info(f"{tarih_str} tarihi için Excel raporu oluşturulacak.")
     
-    if st.button("📥 Rapor Oluştur", type="primary"):
-        with st.spinner("Rapor oluşturuluyor..."):
-            try:
-                r = requests.post(f"{API_BASE}/api/excel", params={"tarih": tarih_str}, timeout=30)
-                if r.status_code == 200:
-                    data = r.json()
-                    st.success(f"✅ Rapor oluşturuldu: {data['dosya']}")
-                    st.json(data)
-                else:
-                    st.error(f"❌ Hata: {r.text}")
-            except Exception as e:
-                st.error(f"Bağlantı hatası: {e}")
-    
-    # Mevcut raporlar
-    st.divider()
-    st.subheader("📁 Üretilmiş Raporlar")
-    st.caption("Raporlar `output/` klasöründe saklanır.")
+    @st.cache_data(show_spinner="Rapor sunucudan alınıyor...", ttl=300)
+    def get_excel_data(t):
+        r = requests.get(f"{API_BASE}/api/excel", params={"tarih": t}, timeout=30)
+        r.raise_for_status()
+        return r.content
+        
+    try:
+        excel_bytes = get_excel_data(tarih_str)
+        st.download_button(
+            label="📥 Raporu İndir",
+            data=excel_bytes,
+            file_name=f"rapor_{tarih_str}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
+    except Exception as e:
+        st.error(f"Rapor alınamadı: {e}")
