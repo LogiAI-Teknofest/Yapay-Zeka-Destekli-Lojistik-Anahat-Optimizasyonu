@@ -1,12 +1,12 @@
 import random
 from typing import Dict, List
 
-TM_IDS = ["34_01", "06_01", "35_01", "07_01"]
+TM_IDS = ["İstanbul", "Yalova", "Kocaeli", "Tekirdağ"]
 TM_NAMES = {
-    "34_01": "Istanbul",
-    "06_01": "Ankara",
-    "35_01": "Izmir",
-    "07_01": "Antalya",
+    "İstanbul": "Istanbul",
+    "Yalova":   "Yalova",
+    "Kocaeli":  "Kocaeli",
+    "Tekirdağ": "Tekirdag",
 }
 
 

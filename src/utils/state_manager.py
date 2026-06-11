@@ -12,28 +12,57 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Sabit Veri ────────────────────────────────────────────────────────────────
+# ── Sabit Veri — logiai_mvp_input.json'dan türetilmiştir ─────────────────────
 
 TM_MAX_CAP: Dict[str, int] = {
-    "34_01": 5000,
-    "06_01": 4500,
-    "35_01": 3000,
-    "07_01": 2500,
+    "İstanbul":   1092270,
+    "Yalova":      883655,
+    "Tekirdağ":    798424,
+    "Eskişehir":   786932,
+    "Manisa":      775103,
+    "Kocaeli":     539280,
+    "Balıkesir":   510472,
+    "Bilecik":     278304,
+    "Denizli":     250000,
+    "Zonguldak":   200000,
+    "Mersin":      180000,
+    "Mardin":      150000,
+    "Sivas":       140000,
+    "Karaman":     130000,
+    "Isparta":     120000,
+    "Erzincan":    110000,
+    "Kütahya":     100000,
+    "Şanlıurfa":    90000,
 }
 
-# α_i: Tır yanaşma uygunluğu — Kişi B'nin OR-Tools modeli bu bilgiyi kullanır
+# α_i: Tır yanaşma uygunluğu — kiralık rotalarda tır kullanan şehirler
 TM_ACCEPTS_TRUCK: Dict[str, bool] = {
-    "34_01": True,
-    "06_01": True,
-    "35_01": False,
-    "07_01": False,
+    "İstanbul":  True,
+    "Yalova":    True,
+    "Tekirdağ":  True,
+    "Eskişehir": True,
+    "Manisa":    True,
+    "Kocaeli":   True,
+    "Balıkesir": True,
+    "Bilecik":   False,
+    "Denizli":   False,
+    "Zonguldak": False,
+    "Mersin":    False,
+    "Mardin":    False,
+    "Sivas":     False,
+    "Karaman":   False,
+    "Isparta":   False,
+    "Erzincan":  False,
+    "Kütahya":   False,
+    "Şanlıurfa": False,
 }
 
+# Araç kapasiteleri — Araç_Kapasite_Maliyet.xlsx gerçek değerleri
 VEHICLE_INFO: Dict[str, Dict] = {
-    "TIR_01":        {"type": "Tır",         "capacity": 3000},
-    "KAMYON_01":     {"type": "Kamyon",       "capacity": 1500},
-    "HAF_KAMYON_01": {"type": "Hafif Kamyon", "capacity": 800},
-    "KAMYONET_01":   {"type": "Kamyonet",     "capacity": 400},
+    "KIR_TIR_01":        {"type": "Tır",          "capacity": 22400},
+    "KIR_KAMYON_01":     {"type": "Kamyon",        "capacity": 12000},
+    "KIR_HAFIF_01":      {"type": "Hafif Kamyon",  "capacity": 7200},
+    "KIR_KAMYONET_01":   {"type": "Kamyonet",      "capacity": 5600},
 }
 
 # 2E-VRP echelon sabitleri (MVP'de sadece SECOND aktif)
