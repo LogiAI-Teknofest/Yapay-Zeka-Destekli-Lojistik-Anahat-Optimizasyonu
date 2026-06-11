@@ -22,9 +22,11 @@ _JOB_PREFIX  = "logiai:job:"
 _DATE_PREFIX = "logiai:date:"
 _JOB_TTL = 3600
 
+_pool = redis.ConnectionPool(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
 
 def _client() -> redis.Redis:
-    return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    return redis.Redis(connection_pool=_pool)
 
 
 def _now() -> str:

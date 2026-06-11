@@ -68,15 +68,15 @@ def test_reset_states():
 
         tms  = list(_r.scan_iter(match="TM:*:State"))
         vehs = list(_r.scan_iter(match="Vehicle:*:State"))
-        assert len(tms)  == 4, f"4 TM bekleniyor, gelen={len(tms)}"
-        assert len(vehs) == 4, f"4 arac bekleniyor, gelen={len(vehs)}"
+        assert len(tms)  == 18, f"18 TM bekleniyor, gelen={len(tms)}"
+        assert len(vehs) == 4,  f"4 arac bekleniyor, gelen={len(vehs)}"
 
-        cap      = _r.hget("TM:34_01:State", "MaxCapacity")
-        overload = _r.hget("TM:34_01:State", "OverloadAmount")
-        truck    = _r.hget("TM:34_01:State", "AcceptsTruck")
-        assert cap      == "5000", f"MaxCapacity=5000 bekleniyor, gelen={cap}"
-        assert overload == "0",    f"OverloadAmount=0 bekleniyor, gelen={overload}"
-        assert truck    == "1",    f"AcceptsTruck=1 bekleniyor (34_01 tir kabul), gelen={truck}"
+        cap      = _r.hget("TM:İstanbul:State", "MaxCapacity")
+        overload = _r.hget("TM:İstanbul:State", "OverloadAmount")
+        truck    = _r.hget("TM:İstanbul:State", "AcceptsTruck")
+        assert cap      == "1092270", f"MaxCapacity=1092270 bekleniyor, gelen={cap}"
+        assert overload == "0",       f"OverloadAmount=0 bekleniyor, gelen={overload}"
+        assert truck    == "1",       f"AcceptsTruck=1 bekleniyor (Istanbul tir kabul), gelen={truck}"
         print(f"  OK  {len(tms)} TM, {len(vehs)} arac  MaxCap={cap}  delta_i={overload}  Tir={truck}")
         return PASS
     except Exception as e:
@@ -91,21 +91,21 @@ def test_load_package():
         from src.utils.state_manager import RedisStateManager
         sm = RedisStateManager()
 
-        pkg = {"pkg_id": "PKG_001", "tm_id": "34_01", "desi": 500.5}
-        ok  = sm.try_load_package(pkg, "TIR_01")
+        pkg = {"pkg_id": "PKG_001", "tm_id": "İstanbul", "desi": 500.5}
+        ok  = sm.try_load_package(pkg, "KIR_TIR_01")
         assert ok, "Yukleme basarili olmali"
-        v_state = sm.get_vehicle_state("TIR_01")
+        v_state = sm.get_vehicle_state("KIR_TIR_01")
         assert v_state["current"] == 500.5, f"Arac yuku=500.5 bekleniyor, gelen={v_state['current']}"
         print(f"  OK  500.5 desi yuklendi (float hincrbyfloat calisiyor)")
 
-        big = {"pkg_id": "PKG_BIG", "tm_id": "34_01", "desi": 3000.0}
-        ok2 = sm.try_load_package(big, "TIR_01")
+        big = {"pkg_id": "PKG_BIG", "tm_id": "İstanbul", "desi": 22400.0}
+        ok2 = sm.try_load_package(big, "KIR_TIR_01")
         assert not ok2, "Kapasite asimi reddedilmeli"
         print(f"  OK  Arac kapasitesi asimi dogru reddedildi")
 
-        pkg2 = {"pkg_id": "PKG_002", "tm_id": "34_01", "desi": 200.0}
-        sm.try_load_package(pkg2, "TIR_01")
-        v_state2 = sm.get_vehicle_state("TIR_01")
+        pkg2 = {"pkg_id": "PKG_002", "tm_id": "İstanbul", "desi": 200.0}
+        sm.try_load_package(pkg2, "KIR_TIR_01")
+        v_state2 = sm.get_vehicle_state("KIR_TIR_01")
         assert v_state2["current"] == 700.5, f"Kumulatif yuk=700.5 bekleniyor, gelen={v_state2['current']}"
         print(f"  OK  Kumulatif yuk dogru: {v_state2['current']} desi")
         return PASS
@@ -121,15 +121,15 @@ def test_overload_tracking():
         from src.utils.state_manager import RedisStateManager
         sm = RedisStateManager()
 
-        _r.hset("TM:06_01:State", "CurrentLoad", 4200)
+        _r.hset("TM:Yalova:State", "CurrentLoad", 883200)
 
-        pkg = {"pkg_id": "PKG_OVR", "tm_id": "06_01", "desi": 600.0}
-        ok  = sm.try_load_package(pkg, "HAF_KAMYON_01")
+        pkg = {"pkg_id": "PKG_OVR", "tm_id": "Yalova", "desi": 600.0}
+        ok  = sm.try_load_package(pkg, "KIR_HAFIF_01")
         assert ok, "Arac kapasitesi uygun, yuklenmeli (TM soft constraint)"
 
-        tm_state = sm.get_tm_state("06_01")
+        tm_state = sm.get_tm_state("Yalova")
         assert tm_state["overload"] > 0, f"delta_i > 0 bekleniyor, gelen={tm_state['overload']}"
-        print(f"  OK  TM:06_01  delta_i={tm_state['overload']:.1f} desi")
+        print(f"  OK  TM:Yalova  delta_i={tm_state['overload']:.1f} desi")
 
         total = sm.get_total_overload()
         assert total > 0
@@ -148,18 +148,18 @@ def test_eta_tracking():
         sm = RedisStateManager()
 
         now = int(time.time())
-        sm.update_eta("KAMYON_01",     "35_01", now + 1800)
-        sm.update_eta("HAF_KAMYON_01", "35_01", now + 900)
+        sm.update_eta("KIR_KAMYON_01", "Kocaeli", now + 1800)
+        sm.update_eta("KIR_HAFIF_01",  "Kocaeli", now + 900)
 
-        result = sm.get_next_vehicle_eta("35_01")
+        result = sm.get_next_vehicle_eta("Kocaeli")
         assert result is not None
         next_v, eta_ts = result
-        assert next_v == "HAF_KAMYON_01", f"En yakin arac yanlis: {next_v}"
+        assert next_v == "KIR_HAFIF_01", f"En yakin arac yanlis: {next_v}"
         print(f"  OK  En yakin arac: {next_v}  ETA={eta_ts}")
 
-        etas = sm.get_all_etas_for_tm("35_01")
+        etas = sm.get_all_etas_for_tm("Kocaeli")
         assert len(etas) == 2
-        print(f"  OK  TM:35_01 icin {len(etas)} ETA kaydi")
+        print(f"  OK  TM:Kocaeli icin {len(etas)} ETA kaydi")
         return PASS
     except Exception as e:
         print(f"  FAIL  {e}")
@@ -173,18 +173,18 @@ def test_route_echelon():
         from src.utils.state_manager import RedisStateManager, ECHELON_FIRST, ECHELON_SECOND
         sm = RedisStateManager()
 
-        key = sm.log_route_echelon("TIR_01", ["34_01", "06_01"], echelon=ECHELON_SECOND)
+        key = sm.log_route_echelon("KIR_TIR_01", ["İstanbul", "Yalova"], echelon=ECHELON_SECOND)
         assert "Echelon:2" in key
         stops = _r.lrange(key, 0, -1)
-        assert stops == ["34_01", "06_01"], f"Rota duraklari yanlis: {stops}"
+        assert stops == ["İstanbul", "Yalova"], f"Rota duraklari yanlis: {stops}"
         assert _r.ttl(key) > 0
         print(f"  OK  Echelon-2: {stops}  TTL={_r.ttl(key)}s")
 
-        key1 = sm.log_route_echelon("KAMYONET_01", ["07_01"], echelon=ECHELON_FIRST)
+        key1 = sm.log_route_echelon("KIR_KAMYONET_01", ["Kocaeli"], echelon=ECHELON_FIRST)
         assert "Echelon:1" in key1
         print(f"  OK  Echelon-1 iskelet hazir (MVP'de pasif)")
 
-        routes = sm.get_route_echelon("TIR_01", echelon=ECHELON_SECOND)
+        routes = sm.get_route_echelon("KIR_TIR_01", echelon=ECHELON_SECOND)
         assert len(routes) >= 1
         print(f"  OK  get_route_echelon: {len(routes)} rota okundu")
         return PASS
@@ -204,8 +204,8 @@ def test_apply_route_loads():
         packages = generate_test_packages(count=18, seed=42)
 
         route_packages = {
-            "TIR_01":    [p for p in packages if p["tm_id"] in ("34_01", "06_01")][:5],
-            "KAMYON_01": [p for p in packages if p["tm_id"] in ("35_01", "07_01")][:3],
+            "KIR_TIR_01":    [p for p in packages if p["tm_id"] in ("İstanbul", "Yalova")][:5],
+            "KIR_KAMYON_01": [p for p in packages if p["tm_id"] in ("Kocaeli", "Tekirdağ")][:3],
         }
 
         assigned = sm.apply_route_loads(route_packages)
