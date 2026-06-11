@@ -3,11 +3,16 @@ FastAPI Gateway — Lojistik Optimizasyon Sistemi
 Person D: Sistem Mimarı ve Arayüz Geliştiricisi
 
 Modüller:
-- /api/optimize  → OR-Tools rota optimizasyonu
-- /api/predict   → LSTM talep tahmini (placeholder)
-- /api/fleet     → Filo atama durumu
-- /api/tm-status → Transfer merkezi kapasite izleme
-- /api/excel     → Excel çıktı üretimi
+- /api/optimize        → OR-Tools rota optimizasyonu (senkron)
+- /api/optimize/start  → Asenkron job başlatıcı (pending/running/done/error)
+- /api/optimize/status → Job durum sorgulama
+- /api/optimize/async  → Dashboard uyumlu async başlatıcı (PENDING/COMPLETED/FAILED)
+- /api/jobs/{job_id}   → Dashboard uyumlu job sorgulama (TTL: 1 saat)
+- /api/optimize/stream → SSE gerçek zamanlı akış
+- /api/predict         → LSTM talep tahmini (placeholder)
+- /api/fleet           → Filo atama durumu
+- /api/tm-status       → Transfer merkezi kapasite izleme
+- /api/excel           → Excel çıktı üretimi
 """
 
  
@@ -409,6 +414,119 @@ def optimize_status(job_id: str):
         response["finished_at"] = job.get("finished_at")
     elif job["status"] == "error":
         response["error"] = job["error"]
+        response["finished_at"] = job.get("finished_at")
+
+    return response
+
+
+# ──────────────────────────────────────────────
+#  Async Endpoints — Dashboard Uyumluluk Katmanı
+#  POST /api/optimize/async  →  job_id döner (PENDING/RUNNING/COMPLETED/FAILED)
+#  GET  /api/jobs/{job_id}   →  job durumu + sonuç
+#  Bu endpoint'ler _job_store'u paylaşır; SSE endpoint'inden bağımsız tüketilebilir.
+# ──────────────────────────────────────────────
+
+class AsyncJobResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+@app.post("/api/optimize/async", response_model=AsyncJobResponse)
+def optimize_async(req: OptimizeRequest):
+    """
+    Dashboard Uyumlu Asenkron Optimizasyon Başlatıcı
+
+    /api/optimize/start ile aynı mantığı kullanır ancak status değerleri
+    dashboard'un beklediği büyük harf formatındadır:
+    PENDING → RUNNING → COMPLETED | FAILED
+    """
+    if not os.path.exists(INPUT_JSON):
+        raise HTTPException(404, f"Girdi dosyası bulunamadı: {INPUT_JSON}")
+
+    try:
+        data = load_input(INPUT_JSON)
+    except DataContractError as e:
+        raise HTTPException(400, f"Veri sözleşmesi hatası: {e}")
+
+    dates = available_dates(data)
+    if req.tarih not in dates:
+        raise HTTPException(
+            404,
+            f"{req.tarih} tarihi için talep verisi bulunamadı. "
+            f"Mevcut tarihler: {dates}"
+        )
+
+    job_id = str(uuid.uuid4())
+    with _job_lock:
+        _job_store[job_id] = {
+            "status": "PENDING",
+            "tarih": req.tarih,
+            "time_limit": req.time_limit,
+            "created_at": datetime.datetime.now().isoformat(),
+            "started_at": None,
+            "result": None,
+            "error": None,
+        }
+
+    def _async_worker(jid: str, d: dict, date: str, tl: int):
+        with _job_lock:
+            _job_store[jid]["status"] = "RUNNING"
+            _job_store[jid]["started_at"] = datetime.datetime.now().isoformat()
+        try:
+            res = _run_pipeline(d, date, time_limit_sec=tl)
+            with _job_lock:
+                _job_store[jid]["status"] = "COMPLETED"
+                _job_store[jid]["result"] = res
+                _job_store[jid]["finished_at"] = datetime.datetime.now().isoformat()
+        except Exception as exc:
+            with _job_lock:
+                _job_store[jid]["status"] = "FAILED"
+                _job_store[jid]["error"] = str(exc)
+                _job_store[jid]["finished_at"] = datetime.datetime.now().isoformat()
+
+    threading.Thread(
+        target=_async_worker,
+        args=(job_id, data, req.tarih, req.time_limit),
+        daemon=True,
+    ).start()
+
+    return {"job_id": job_id, "status": "PENDING"}
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str):
+    """
+    Dashboard Uyumlu Job Durum Sorgulama
+
+    Dönen status değerleri: PENDING | RUNNING | COMPLETED | FAILED
+    COMPLETED durumunda 'result' alanında optimizasyon sonucu bulunur.
+    Job 1 saatten eski ise 404 döner (TTL: 1 saat).
+    """
+    with _job_lock:
+        job = _job_store.get(job_id)
+
+    if not job:
+        raise HTTPException(404, "Job bulunamadı veya süresi doldu (TTL: 1 saat).")
+
+    # TTL kontrolü — 1 saatten eski job'ları kaldır
+    created = datetime.datetime.fromisoformat(job["created_at"])
+    if (datetime.datetime.now() - created).total_seconds() > 3600:
+        with _job_lock:
+            _job_store.pop(job_id, None)
+        raise HTTPException(404, "Job süresi doldu (TTL: 1 saat).")
+
+    response: dict = {
+        "job_id": job_id,
+        "status": job["status"],
+        "tarih": job.get("tarih"),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+    }
+    if job["status"] == "COMPLETED":
+        response["result"] = job["result"]
+        response["finished_at"] = job.get("finished_at")
+    elif job["status"] == "FAILED":
+        response["error"] = job.get("error")
         response["finished_at"] = job.get("finished_at")
 
     return response

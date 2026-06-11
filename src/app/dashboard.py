@@ -19,7 +19,7 @@ from streamlit_folium import st_folium
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
-import json, os, time
+import json, os
 from datetime import datetime, timedelta
 
 # ── Sayfa konfigürasyonu ──
@@ -87,83 +87,56 @@ def load_demand_data():
     except:
         return {"toplam_kayit": 0, "talepler": []}
 
-def _submit_optimization_job(tarih: str) -> str | None:
-    """Arka planda optimizasyon başlatır, job_id döner."""
-    try:
-        r = requests.post(
-            f"{API_BASE}/api/optimize/async",
-            json={"tarih": tarih},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()["job_id"]
-    except Exception as e:
-        st.error(f"İş gönderme hatası: {e}")
-        return None
-
-
-def _poll_job(job_id: str) -> dict | None:
-    """Job durumunu bir kez sorgular."""
-    try:
-        r = requests.get(f"{API_BASE}/api/jobs/{job_id}", timeout=5)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return None
-
-
-def get_optimization_result(tarih: str) -> dict | None:
+def get_optimization_result_sse(tarih: str, time_limit: int = 540) -> dict | None:
     """
-    Redis polling ile optimizasyon sonucunu döner.
+    SSE tabanlı optimizasyon yükleyici.
 
     - Aynı tarih için önceden alınmış sonuç session_state'te varsa anında döner.
-    - Devam eden bir job varsa polling yapar, UI rerun ile güncellenir.
-    - Hiç job yoksa yeni job başlatır.
+    - Yoksa /api/optimize/stream SSE akışını tüketir:
+        • Her 5 sn'de gelen "running" eventi ilerleme göstergesi olarak gösterilir.
+        • "done" eventi gelince sonucu döner ve önbelleğe alır.
+        • "error" eventi veya bağlantı hatasında hata gösterilip None döner.
     """
     cache_key = f"opt_result_{tarih}"
-    job_key = f"opt_job_{tarih}"
 
     # Önbellekte hazır sonuç var mı?
     if st.session_state.get(cache_key):
         return st.session_state[cache_key]
 
-    # Devam eden job var mı?
-    job_id = st.session_state.get(job_key)
-    if job_id:
-        job = _poll_job(job_id)
-        if job is None:
-            st.warning("Job durumu alınamadı, yeniden deneniyor...")
-            time.sleep(2)
-            st.rerun()
-            return None
-        if job["status"] == "COMPLETED":
-            st.session_state[cache_key] = job["result"]
-            del st.session_state[job_key]
-            return job["result"]
-        if job["status"] == "FAILED":
-            st.error(f"Optimizasyon başarısız: {job.get('error', '?')}")
-            del st.session_state[job_key]
-            return None
-        # PENDING veya RUNNING — bekle ve yeniden çalıştır
-        elapsed = ""
-        if job.get("started_at"):
-            secs = (datetime.utcnow() - datetime.fromisoformat(
-                job["started_at"].replace("Z", "+00:00").replace("+00:00", "")
-            )).seconds
-            elapsed = f" (~{secs} sn)"
-        st.info(f"⏳ Optimizasyon çalışıyor{elapsed}... (durum: {job['status']})")
-        time.sleep(2)
-        st.rerun()
+    # SSE akışını tüket
+    status_placeholder = st.empty()
+    try:
+        with requests.post(
+            f"{API_BASE}/api/optimize/stream",
+            json={"tarih": tarih, "time_limit": time_limit},
+            stream=True,
+            timeout=(10, 700),  # bağlantı 10 sn, okuma 700 sn (9 dk OR-Tools limiti için)
+        ) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                event = json.loads(line[6:])
+                if event["status"] == "running":
+                    elapsed = event.get("elapsed", 0)
+                    status_placeholder.info(f"⏳ Optimizasyon çalışıyor... ({elapsed} sn)")
+                elif event["status"] == "done":
+                    status_placeholder.empty()
+                    result = event["result"]
+                    st.session_state[cache_key] = result
+                    return result
+                elif event["status"] == "error":
+                    status_placeholder.empty()
+                    st.error(f"❌ Optimizasyon hatası: {event.get('error', '?')}")
+                    return None
+    except Exception as e:
+        status_placeholder.empty()
+        st.error(f"🔌 SSE bağlantı hatası: {e}")
         return None
 
-    # Henüz job yok — yeni job başlat
-    new_job_id = _submit_optimization_job(tarih)
-    if new_job_id:
-        st.session_state[job_key] = new_job_id
-        st.info("⏳ Optimizasyon başlatıldı...")
-        time.sleep(1)
-        st.rerun()
     return None
+
+
 
 def get_tm_status(tarih):
     try:
@@ -199,7 +172,7 @@ if page == "Genel Bakış":
     st.header("📊 Genel Bakış")
 
     tarih_str = planlama_tarihi.strftime("%Y-%m-%d")
-    result = get_optimization_result(tarih_str)
+    result = get_optimization_result_sse(tarih_str)
     
     if result and result.get("solver_status"):
         # KPI Kartları
@@ -257,7 +230,7 @@ elif page == "Rota Haritası":
     st.header("🗺️ Rota Haritası")
 
     tarih_str = planlama_tarihi.strftime("%Y-%m-%d")
-    result = get_optimization_result(tarih_str)
+    result = get_optimization_result_sse(tarih_str)
     
     params = load_params()
     cities = {c["id"]: c for c in params.get("sehirler", [])}
