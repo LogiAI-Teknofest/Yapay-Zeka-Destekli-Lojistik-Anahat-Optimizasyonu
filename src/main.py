@@ -30,6 +30,7 @@ Kullanım:
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import logging
 import sys
@@ -92,6 +93,7 @@ def run_pipeline(
     PipelineResult
     """
     log.info("══════ Boru hattı başlatıldı [%s] ══════", date)
+    start_time = datetime.datetime.now()
 
     # ── Aşama 1: Greedy Kiralık Atama ────────────────────────────────────────
     rental_assignments_list, spill_demand = run_greedy_assignment(data, date)
@@ -126,6 +128,8 @@ def run_pipeline(
         if leftover > 1.0:
             unassigned[(o, d)] = leftover
 
+    elapsed = (datetime.datetime.now() - start_time).total_seconds()
+
     result = PipelineResult(
         date=date,
         rental_assignments=tuple(rental_assignments_list),
@@ -134,6 +138,7 @@ def run_pipeline(
         total_spot_cost=total_spot_cost,
         unassigned_demand=unassigned,
         solver_status=solver_status,
+        calisma_suresi_sn=round(elapsed, 3),
     )
 
     log.info("══════ Boru hattı tamamlandı [%s] ══════", date)
@@ -209,7 +214,7 @@ def print_result(result: PipelineResult) -> None:
 # JSON Çıktı Serileştirici
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _result_to_dict(result: PipelineResult) -> dict[str, Any]:
+def result_to_dict(result: PipelineResult) -> dict[str, Any]:
     """PipelineResult'ı JSON serileştirilebilir dict'e çevirir."""
     return {
         "date": result.date,
@@ -222,6 +227,7 @@ def _result_to_dict(result: PipelineResult) -> dict[str, Any]:
             f"{o}_{d}": desi
             for (o, d), desi in result.unassigned_demand.items()
         },
+        "calisma_suresi_sn": result.calisma_suresi_sn,
         "rental_assignments": [
             {
                 "vehicle_id":    a.vehicle_id,
@@ -264,7 +270,7 @@ def write_json_output(
             "dates": [r.date for r in results],
             "grand_total_cost": sum(r.total_cost for r in results),
         },
-        "results": [_result_to_dict(r) for r in results],
+        "results": [result_to_dict(r) for r in results],
     }
     with path.open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)

@@ -169,6 +169,7 @@ class PipelineResult:
     total_spot_cost:     float
     unassigned_demand:   dict[RouteKey, float]
     solver_status:       SolverStatus
+    calisma_suresi_sn:   float = 0.0
 
     # ── Türetilmiş metrikler ─────────────────────────────────────────────────
 

@@ -26,9 +26,7 @@ if _PROJECT_ROOT not in sys.path:
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from optimization.greedy import run_greedy_assignment
-from optimization.vrp_solver import run_spot_vrp
-from models.data_types import PipelineResult, RentalAssignment, SpotAssignment
+from main import run_pipeline, result_to_dict
 from utils.data_loader import load_input, available_dates, DataContractError
 from app.job_manager import create_job, set_running, set_completed, set_failed, get_job as _get_job, get_job_for_date as _get_job_for_date
 
@@ -182,74 +180,8 @@ def _run_pipeline(data: dict, date: str, time_limit_sec: int = 540) -> dict:
     Aşama 1 → Greedy kiralık atama   (optimization.greedy)
     Aşama 2 → OR-Tools Open VRP      (optimization.vrp_solver)
     """
-    # Aşama 1: Greedy Kiralık Atama
-    rental_assignments_list, spill_demand = run_greedy_assignment(data, date)
-    total_rental_cost = sum(a.cost for a in rental_assignments_list)
-
-    # Aşama 2: Spot VRP + Fallback
-    spot_assignments_list = run_spot_vrp(data, spill_demand, time_limit_sec)
-    total_spot_cost = sum(a.cost for a in spot_assignments_list)
-
-    # Çözücü Durum Kodu
-    fallback_count = sum(1 for a in spot_assignments_list if a.is_fallback)
-
-    if not spill_demand:
-        solver_status = "NO_DEMAND"
-    elif fallback_count > 0:
-        solver_status = "FALLBACK"
-    elif spot_assignments_list:
-        solver_status = "FEASIBLE"
-    else:
-        solver_status = "OPTIMAL"
-
-    # Atanamayan Talep Kontrolü
-    assigned_spill: dict[tuple[str, str], float] = {}
-    for a in spot_assignments_list:
-        key = (a.origin, a.destination)
-        assigned_spill[key] = assigned_spill.get(key, 0.0) + a.assigned_desi
-
-    unassigned: dict[str, float] = {}
-    for (o, d), desi in spill_demand.items():
-        leftover = desi - assigned_spill.get((o, d), 0.0)
-        if leftover > 1.0:
-            unassigned[f"{o}_{d}"] = leftover
-
-    return {
-        "date": date,
-        "solver_status": solver_status,
-        "total_rental_cost": total_rental_cost,
-        "total_spot_cost": total_spot_cost,
-        "total_cost": total_rental_cost + total_spot_cost,
-        "fallback_count": fallback_count,
-        "unassigned_demand": unassigned,
-        "rental_assignments": [
-            {
-                "vehicle_id":    a.vehicle_id,
-                "origin":        a.origin,
-                "destination":   a.destination,
-                "assigned_desi": a.assigned_desi,
-                "capacity_desi": a.capacity_desi,
-                "utilisation":   round(a.utilisation_rate, 4),
-                "cost":          a.cost,
-                "cost_type":     a.cost_type,
-            }
-            for a in rental_assignments_list
-        ],
-        "spot_assignments": [
-            {
-                "vehicle_type":  a.vehicle_type,
-                "origin":        a.origin,
-                "destination":   a.destination,
-                "assigned_desi": a.assigned_desi,
-                "capacity_desi": a.capacity_desi,
-                "utilisation":   round(a.utilisation_rate, 4),
-                "cost":          a.cost,
-                "route_path":    list(a.route_path),
-                "source":        a.source,
-            }
-            for a in spot_assignments_list
-        ],
-    }
+    res = run_pipeline(data, date, time_limit_sec=time_limit_sec)
+    return result_to_dict(res)
 
 # calc_spot_cost ve select_spot_vehicle artık kullanılmıyor;
 # spot araç seçimi OR-Tools tarafından pipeline içinde yapılıyor.
