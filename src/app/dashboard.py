@@ -57,10 +57,7 @@ with st.sidebar:
         max_value=datetime(2026, 5, 10),
     )
     
-    sla_katsayi = st.slider("SLA Ceza Katsayısı", 0.0, 50.0, 15.0, 1.0)
-    ellemcele_katsayi = st.slider("TM Elleçleme Ceza Katsayısı", 0.0, 30.0, 8.0, 1.0)
-    spot_limit = st.number_input("Maks Spot Araç", min_value=0, max_value=100, value=20)
-    filo_kullanim = st.slider("Filo Kullanım Oranı", 0.0, 1.0, 0.7, 0.05)
+    time_limit_sec = st.slider("OR-Tools Süre Sınırı (sn)", 10, 600, 60, 10)
     
     st.divider()
     st.caption(f"API: {API_BASE}")
@@ -71,9 +68,9 @@ with st.sidebar:
 @st.cache_data(ttl=60)
 def load_params():
     try:
-        r = requests.get(f"{API_BASE}/api/cities", timeout=5)
+        r = requests.get(f"{API_BASE}/api/cities", timeout=10)
         cities = r.json().get("sehirler", [])
-        rv = requests.get(f"{API_BASE}/api/vehicles", timeout=5)
+        rv = requests.get(f"{API_BASE}/api/vehicles", timeout=10)
         vehicles = rv.json().get("arac_tipleri", [])
         return {"sehirler": cities, "arac_tipleri": vehicles}
     except:
@@ -82,17 +79,17 @@ def load_params():
 @st.cache_data(ttl=60)
 def load_demand_data():
     try:
-        r = requests.get(f"{API_BASE}/api/demand")
+        r = requests.get(f"{API_BASE}/api/demand", timeout=10)
         return r.json()
     except:
         return {"toplam_kayit": 0, "talepler": []}
 
-def _submit_optimization_job(tarih: str) -> str | None:
+def _submit_optimization_job(tarih: str, time_limit_sec: int) -> str | None:
     """Arka planda optimizasyon başlatır, job_id döner."""
     try:
         r = requests.post(
             f"{API_BASE}/api/optimize/async",
-            json={"tarih": tarih},
+            json={"tarih": tarih, "time_limit": time_limit_sec},
             timeout=10,
         )
         r.raise_for_status()
@@ -105,23 +102,23 @@ def _submit_optimization_job(tarih: str) -> str | None:
 def _poll_job(job_id: str) -> dict | None:
     """Job durumunu bir kez sorgular."""
     try:
-        r = requests.get(f"{API_BASE}/api/jobs/{job_id}", timeout=5)
+        r = requests.get(f"{API_BASE}/api/jobs/{job_id}", timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception:
         return None
 
 
-def get_optimization_result(tarih: str) -> dict | None:
+def get_optimization_result(tarih: str, time_limit_sec: int) -> dict | None:
     """
     Redis polling ile optimizasyon sonucunu döner.
 
-    - Aynı tarih için önceden alınmış sonuç session_state'te varsa anında döner.
+    - Aynı tarih ve time_limit_sec için önceden alınmış sonuç session_state'te varsa anında döner.
     - Devam eden bir job varsa polling yapar, UI rerun ile güncellenir.
     - Hiç job yoksa yeni job başlatır.
     """
-    cache_key = f"opt_result_{tarih}"
-    job_key = f"opt_job_{tarih}"
+    cache_key = f"opt_result_{tarih}_{time_limit_sec}"
+    job_key = f"opt_job_{tarih}_{time_limit_sec}"
 
     # Önbellekte hazır sonuç var mı?
     if st.session_state.get(cache_key):
@@ -157,7 +154,7 @@ def get_optimization_result(tarih: str) -> dict | None:
         return None
 
     # Henüz job yok — yeni job başlat
-    new_job_id = _submit_optimization_job(tarih)
+    new_job_id = _submit_optimization_job(tarih, time_limit_sec)
     if new_job_id:
         st.session_state[job_key] = new_job_id
         st.info("⏳ Optimizasyon başlatıldı...")
@@ -167,7 +164,7 @@ def get_optimization_result(tarih: str) -> dict | None:
 
 def get_tm_status(tarih):
     try:
-        r = requests.get(f"{API_BASE}/api/tm-status", params={"tarih": tarih})
+        r = requests.get(f"{API_BASE}/api/tm-status", params={"tarih": tarih}, timeout=10)
         return r.json()
     except:
         return []
@@ -175,7 +172,7 @@ def get_tm_status(tarih):
 def get_fleet(tarih: str | None = None):
     try:
         params = {"tarih": tarih} if tarih else {}
-        r = requests.get(f"{API_BASE}/api/fleet", params=params)
+        r = requests.get(f"{API_BASE}/api/fleet", params=params, timeout=10)
         return r.json()
     except:
         return []
@@ -186,11 +183,14 @@ COLORS = {
     "KAM": "#ff7f0e", 
     "HAF": "#2ca02c",
     "KMT": "#d62728",
+    "Tır": "#1f77b4",
+    "Kamyon": "#ff7f0e",
+    "Hafif Kamyon": "#2ca02c",
+    "Kamyonet": "#d62728",
     "kirali": "#2ca02c",
     "spot": "#d62728",
 }
 
-ARAC_EMOJI = {"TIR": "🚛", "KAM": "🚚", "HAF": "🛻", "KMT": "🚐"}
 
 # ══════════════════════════════════════════════
 #  SAYFA 1: GENEL BAKIŞ
@@ -200,7 +200,7 @@ if page == "Genel Bakış":
     st.header("📊 Genel Bakış")
 
     tarih_str = planlama_tarihi.strftime("%Y-%m-%d")
-    result = get_optimization_result(tarih_str)
+    result = get_optimization_result(tarih_str, time_limit_sec)
     
     if result and result.get("solver_status"):
         # KPI Kartları
@@ -258,7 +258,7 @@ elif page == "Rota Haritası":
     st.header("🗺️ Rota Haritası")
 
     tarih_str = planlama_tarihi.strftime("%Y-%m-%d")
-    result = get_optimization_result(tarih_str)
+    result = get_optimization_result(tarih_str, time_limit_sec)
     
     params = load_params()
     cities = {c["id"]: c for c in params.get("sehirler", [])}

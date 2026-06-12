@@ -10,10 +10,10 @@ Modüller:
 - /api/excel     → Excel çıktı üretimi
 """
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
+from typing import Optional
 import json, os, datetime, sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -138,10 +138,6 @@ def _load_city_coords() -> dict[str, dict]:
     _CITY_COORDS_CACHE = coords
     return coords
 
-
-def load_params():
-    with open(os.path.join(DATA_DIR, "parameters.json"), "r") as f:
-        return json.load(f)
 
 def load_demand():
     """daily_demand'ı düz liste formatına çevirir (günlük_talep.csv uyumu)."""
@@ -328,7 +324,6 @@ def predict(
     Şimdilik historical data üzerinden basit istatistiksel tahmin.
     """
     demand_data = load_demand()
-    params = load_params()
 
     # Basit ortalama + mevsimsel etki
     from collections import defaultdict
@@ -378,7 +373,7 @@ def fleet_status(tarih: Optional[str] = Query(None)):
             vid = v["id"]
             vtype = v.get("vehicle_type", "Tır")
             cost_row = data.get("cost_matrix", {}).get(origin, {}).get(dest, {}).get(vtype, {})
-            sabit = float(cost_row.get("kiralık", 0) or cost_row.get("kiralik", 0))
+            sabit = float(cost_row.get("kiralik", cost_row.get("kiralık", 0)))
             result.append(FleetVehicle(
                 arac_id=vid,
                 tip=vtype,
@@ -438,7 +433,6 @@ def generate_excel(tarih: str = Query(...)):
     from openpyxl.styles import Font, PatternFill, Alignment
     from fastapi.responses import FileResponse
 
-    params = load_params()
     demand_data = load_demand()
     date_demands = get_demand_for_date(demand_data, tarih)
 
@@ -475,7 +469,7 @@ def generate_excel(tarih: str = Query(...)):
             vtype = v.get("vehicle_type", "Tır")
             cap   = float(v.get("capacity_desi", 0))
             cost_row = mvp_data.get("cost_matrix", {}).get(src, {}).get(dst, {}).get(vtype, {})
-            sabit = float(cost_row.get("kiralık", 0) or cost_row.get("kiralik", 0))
+            sabit = float(cost_row.get("kiralik", cost_row.get("kiralık", 0)))
             total_fixed += sabit
             ws1.cell(row=row_idx, column=1, value=v["id"])
             ws1.cell(row=row_idx, column=2, value="Kiralık " + vtype)
@@ -546,8 +540,15 @@ def list_cities():
 @app.get("/api/vehicles")
 def list_vehicles():
     """Araç tipi bilgileri"""
-    params = load_params()
-    return {"arac_tipleri": params["arac_tipleri"]}
+    # parameters.json'a olan bağımlılık kaldırıldı, yeni pipeline kapasiteleri statik olarak dönülüyor.
+    return {
+        "arac_tipleri": [
+            {"id": "TIR", "ad": "Tır", "kapasite_desi": 22400, "sabit_maliyet": 7000.0, "km_basi_maliyet": 13.0, "tir_yanasma_gerekli": True},
+            {"id": "KAM", "ad": "Kamyon", "kapasite_desi": 12000, "sabit_maliyet": 5000.0, "km_basi_maliyet": 10.0, "tir_yanasma_gerekli": False},
+            {"id": "HAF", "ad": "Hafif Kamyon", "kapasite_desi": 7200, "sabit_maliyet": 5000.0, "km_basi_maliyet": 10.0, "tir_yanasma_gerekli": False},
+            {"id": "KMT", "ad": "Kamyonet", "kapasite_desi": 5600, "sabit_maliyet": 3750.0, "km_basi_maliyet": 6.0, "tir_yanasma_gerekli": False}
+        ]
+    }
 
 @app.get("/api/demand")
 def get_demand(
