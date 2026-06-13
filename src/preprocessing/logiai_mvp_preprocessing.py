@@ -29,6 +29,25 @@ except ImportError:
 
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 OUTPUT_PATH = PROJECT_ROOT / "data" / "processed" / "logiai_mvp_input.json"
+DEFAULT_TRANSFER_CENTER_CAPACITY_DESI = 10_000_000
+DEFAULT_TIR_ALLOWED = True
+
+VEHICLE_TYPE_ALIASES = {
+    "hafif kamyon": "HAF",
+    "hafif_kamyon": "HAF",
+    "hafifkamyon": "HAF",
+    "tir": "TIR",
+    "tır": "TIR",
+    "kamyonet": "KMT",
+    "kamyon": "KAM",
+}
+
+VEHICLE_TYPE_NAMES = {
+    "HAF": "Hafif Kamyon",
+    "TIR": "Tır",
+    "KAM": "Kamyon",
+    "KMT": "Kamyonet",
+}
 
 def normalize_key(value: object) -> str:
     text = "" if pd.isna(value) else str(value)
@@ -59,6 +78,17 @@ def find_column(df: pd.DataFrame, *needles: str) -> object:
 def city_display(value: object) -> str:
     return title_city_name(normalize_city_name(value))
 
+
+def normalize_vehicle_type(value: object) -> str:
+    key = normalize_key(value).replace(" ", "_")
+    if key in VEHICLE_TYPE_ALIASES:
+        return VEHICLE_TYPE_ALIASES[key]
+
+    compact_key = key.replace("_", "")
+    if compact_key in VEHICLE_TYPE_ALIASES:
+        return VEHICLE_TYPE_ALIASES[compact_key]
+
+    raise KeyError(f"Standart araç tipi bulunamadı: {value}")
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     radius_km = 6371.0
@@ -93,7 +123,7 @@ def load_vehicle_costs() -> pd.DataFrame:
     df = read_raw_file(find_raw_excel("arac", "kapasite"))
     return pd.DataFrame(
         {
-            "vehicle_type": df[find_column(df, "arac")].astype(str).map(str.strip),
+            "vehicle_type": df[find_column(df, "arac")].map(normalize_vehicle_type),
             "capacity_desi": parse_decimal_number(df[find_column(df, "kapasite")]),
             "rental_fixed": parse_decimal_number(df[find_column(df, "kiralik", "gunluk")]),
             "rental_km": parse_decimal_number(df[find_column(df, "kiralik", "kilometre")]),
@@ -115,7 +145,7 @@ def load_rental_vehicles(vehicle_costs: pd.DataFrame) -> pd.DataFrame:
             "origin": df[origin_col].map(city_display),
             "destination": df[destination_col].map(city_display),
             "vehicle_count": parse_decimal_number(df[count_col]).fillna(0).astype(int),
-            "vehicle_type": df[type_col].astype(str).map(str.strip),
+            "vehicle_type": df[type_col].map(normalize_vehicle_type),
         }
     )
     capacities = vehicle_costs.set_index("vehicle_type")["capacity_desi"].to_dict()
@@ -197,25 +227,46 @@ def build_rental_routes(rental: pd.DataFrame) -> dict[str, list[dict[str, object
     for _, row in rental.iterrows():
         route_key = f"{row['origin']}_{row['destination']}"
         routes.setdefault(route_key, [])
-        vehicle_slug = normalize_key(row["vehicle_type"]).replace(" ", "_").upper()
+        vehicle_type = str(row["vehicle_type"])
         for _idx in range(int(row["vehicle_count"])):
-            counters[vehicle_slug] = counters.get(vehicle_slug, 0) + 1
+            counters[vehicle_type] = counters.get(vehicle_type, 0) + 1
             routes[route_key].append(
                 {
-                    "id": f"KIR_{vehicle_slug}_{counters[vehicle_slug]:02d}",
-                    "vehicle_type": row["vehicle_type"],
+                    "id": f"KIR_{vehicle_type}_{counters[vehicle_type]:02d}",
+                    "vehicle_type": vehicle_type,
                     "capacity_desi": int(row["capacity_desi"]),
                 }
             )
     return routes
 
 
-def build_spot_capacities(vehicle_costs: pd.DataFrame) -> dict[str, int]:
+
+
+
+def build_transfer_centers(coords: dict[str, dict[str, float]]) -> dict[str, dict[str, object]]:
     return {
-        str(row["vehicle_type"]): int(row["capacity_desi"])
-        for _, row in vehicle_costs.iterrows()
+        city: {
+            "lat": coord["lat"],
+            "lon": coord["lon"],
+            "max_capacity_desi": DEFAULT_TRANSFER_CENTER_CAPACITY_DESI,
+            "tir_allowed": DEFAULT_TIR_ALLOWED,
+        }
+        for city, coord in sorted(coords.items())
     }
 
+
+def build_vehicles_info(vehicle_costs: pd.DataFrame) -> dict[str, dict[str, object]]:
+    return {
+        str(row["vehicle_type"]): {
+            "name": VEHICLE_TYPE_NAMES.get(str(row["vehicle_type"]), str(row["vehicle_type"])),
+            "capacity_desi": int(row["capacity_desi"]),
+            "rental_fixed_daily_cost": round(float(row["rental_fixed"]), 2),
+            "rental_cost_per_km": round(float(row["rental_km"]), 2),
+            "spot_fixed_daily_cost": round(float(row["spot_fixed"]), 2),
+            "spot_cost_per_km": round(float(row["spot_km"]), 2),
+        }
+        for _, row in vehicle_costs.iterrows()
+    }
 
 def build_daily_demand(demand: pd.DataFrame) -> dict[str, dict[str, dict[str, float]]]:
     grouped = (
@@ -245,10 +296,11 @@ def build_logiai_mvp_contract() -> dict[str, object]:
     if missing_coordinates:
         contract["missing_coordinates"] = missing_coordinates
     contract.update({
+        "transfer_centers": build_transfer_centers(coords),
+        "vehicles_info": build_vehicles_info(vehicle_costs),
         "distance_matrix": distance_matrix,
         "cost_matrix": build_cost_matrix(distance_matrix, vehicle_costs),
         "rental_routes": build_rental_routes(rental),
-        "spot_capacities": build_spot_capacities(vehicle_costs),
         "daily_demand": build_daily_demand(demand),
     })
     return contract
