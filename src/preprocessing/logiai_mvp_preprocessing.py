@@ -133,7 +133,8 @@ def load_vehicle_costs() -> pd.DataFrame:
     ).dropna()
 
 
-def load_rental_vehicles(vehicle_costs: pd.DataFrame) -> pd.DataFrame:
+# REVIZYON: coords haritası parametre olarak eklendi, böylece koordinatı olmayan şehir içeren satırlar elenecek.
+def load_rental_vehicles(vehicle_costs: pd.DataFrame, coords: dict[str, dict[str, float]]) -> pd.DataFrame:
     df = read_raw_file(find_raw_excel("kiralik", "arac"))
     origin_col = find_column(df, "cikis")
     destination_col = find_column(df, "varis")
@@ -150,10 +151,21 @@ def load_rental_vehicles(vehicle_costs: pd.DataFrame) -> pd.DataFrame:
     )
     capacities = vehicle_costs.set_index("vehicle_type")["capacity_desi"].to_dict()
     rental["capacity_desi"] = rental["vehicle_type"].map(capacities)
-    return rental.dropna(subset=["origin", "destination", "vehicle_type", "capacity_desi"])
+    
+    # Boş string temizliği
+    rental[["origin", "destination"]] = rental[["origin", "destination"]].replace("", pd.NA)
+    rental = rental.dropna(subset=["origin", "destination", "vehicle_type", "capacity_desi"])
+
+    # BEKLENEN DURUM FİLTRESİ: Kalkış veya varış şehri koordinat tablosunda yoksa o satırı eliyoruz.
+    valid_origin = rental["origin"].isin(coords.keys())
+    valid_dest = rental["destination"].isin(coords.keys())
+    rental = rental[valid_origin & valid_dest]
+
+    return rental
 
 
-def load_desi_demand() -> pd.DataFrame:
+# REVIZYON: coords haritası parametre olarak eklendi, böylece koordinatı olmayan şehir içeren satırlar elenecek.
+def load_desi_demand(coords: dict[str, dict[str, float]]) -> pd.DataFrame:
     df = read_raw_file(find_raw_excel("desi", "talep"))
     origin_col = find_column(df, "cikis")
     destination_col = find_column(df, "varis")
@@ -170,10 +182,21 @@ def load_desi_demand() -> pd.DataFrame:
     )
     demand = demand.dropna(subset=["date", "desi"])
     demand = demand[demand["desi"] > 0]
+    
+    # Boş string temizliği
+    demand[["origin", "destination"]] = demand[["origin", "destination"]].replace("", pd.NA)
+    demand = demand.dropna(subset=["origin", "destination"])
+    
+    # BEKLENEN DURUM FİLTRESİ: Kalkış veya varış şehri koordinat tablosunda yoksa o satırı eliyoruz.
+    valid_origin = demand["origin"].isin(coords.keys())
+    valid_dest = demand["destination"].isin(coords.keys())
+    demand = demand[valid_origin & valid_dest]
+
     demand["date"] = demand["date"].dt.date.astype(str)
     return demand
 
 
+# REVIZYON: Bu fonksiyon artık sadece raporlama/loglama amaçlı eksik şehir tespiti yapacak.
 def validate_coordinates(coords: dict[str, dict[str, float]], *tables: pd.DataFrame) -> list[str]:
     required = set()
     for table in tables:
@@ -215,7 +238,7 @@ def build_cost_matrix(
                 rental_cost = float(vehicle["rental_fixed"]) + distance * float(vehicle["rental_km"])
                 spot_cost = float(vehicle["spot_fixed"]) + distance * float(vehicle["spot_km"])
                 cost_matrix[origin][destination][vehicle_type] = {
-                    "kiralık": round(rental_cost, 2),
+                    "kiralik": round(rental_cost, 2),
                     "spot": round(spot_cost, 2),
                 }
     return cost_matrix
@@ -238,9 +261,6 @@ def build_rental_routes(rental: pd.DataFrame) -> dict[str, list[dict[str, object
                 }
             )
     return routes
-
-
-
 
 
 def build_transfer_centers(coords: dict[str, dict[str, float]]) -> dict[str, dict[str, object]]:
@@ -268,6 +288,7 @@ def build_vehicles_info(vehicle_costs: pd.DataFrame) -> dict[str, dict[str, obje
         for _, row in vehicle_costs.iterrows()
     }
 
+
 def build_daily_demand(demand: pd.DataFrame) -> dict[str, dict[str, dict[str, float]]]:
     grouped = (
         demand.groupby(["date", "origin", "destination"], as_index=False)["desi"]
@@ -286,15 +307,36 @@ def build_daily_demand(demand: pd.DataFrame) -> dict[str, dict[str, dict[str, fl
 def build_logiai_mvp_contract() -> dict[str, object]:
     coords = load_coordinates()
     vehicle_costs = load_vehicle_costs()
-    rental = load_rental_vehicles(vehicle_costs)
-    demand = load_desi_demand()
+    
+    # Ham tabloları (filtresiz) sadece eksik şehirleri terminale raporlayabilmek için geçici okuyoruz
+    raw_df_rental = read_raw_file(find_raw_excel("kiralik", "arac"))
+    raw_df_demand = read_raw_file(find_raw_excel("desi", "talep"))
+    
+    # Sütun isimlerini normalize edip validate_coordinates'in anlayacağı şekle getiriyoruz
+    temp_rental = pd.DataFrame({
+        "origin": raw_df_rental[find_column(raw_df_rental, "cikis")].map(city_display),
+        "destination": raw_df_rental[find_column(raw_df_rental, "varis")].map(city_display)
+    })
+    temp_demand = pd.DataFrame({
+        "origin": raw_df_demand[find_column(raw_df_demand, "cikis")].map(city_display),
+        "destination": raw_df_demand[find_column(raw_df_demand, "varis")].map(city_display)
+    })
 
-    missing_coordinates = validate_coordinates(coords, rental, demand)
+    # Eksik şehirleri buluyoruz
+    missing_coordinates = validate_coordinates(coords, temp_rental, temp_demand)
+
+    # BEKLENEN DURUM LOGLAMASI: Çökmüyoruz, sadece terminale uyarı basıyoruz.
+    if missing_coordinates:
+        print(f"\n[UYARI / WARNING] Koordinat tablosunda bulunmayan şehirler tespit edildi: {', '.join(missing_coordinates)}")
+        print("[BILGI / INFO] Bu şehirleri içeren hatalı satırlar veri setinden elendi. Sistem çalışmaya devam ediyor...\n")
+
+    # Gerçek veri yükleme aşamasında koordinatı olmayan satırlar elenerek yükleniyor
+    rental = load_rental_vehicles(vehicle_costs, coords)
+    demand = load_desi_demand(coords)
 
     distance_matrix = build_distance_matrix(coords)
     contract = {}
-    if missing_coordinates:
-        contract["missing_coordinates"] = missing_coordinates
+    
     contract.update({
         "transfer_centers": build_transfer_centers(coords),
         "vehicles_info": build_vehicles_info(vehicle_costs),
