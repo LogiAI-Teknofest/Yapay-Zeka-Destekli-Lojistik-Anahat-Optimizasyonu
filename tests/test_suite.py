@@ -204,46 +204,44 @@ def test_apply_route_loads():
         return FAIL
 
 
-# ── Test 8: Veri Dogrulama ────────────────────────────────────────────────────
+# ── Test 8: Veri Yükleme Doğrulama ───────────────────────────────────────────
 def test_data_validation():
-    _section("TEST 8: Veri Dogrulama (data_validation)")
+    _section("TEST 8: Veri Yukleme Dogrulama (data_loader)")
     try:
-        import pandas as pd
-        from src.preprocessing.data_validation import (
-            validate_transfer_centers,
-            validate_vehicles,
-            validate_packages,
-        )
+        import json
+        import os
+        import tempfile
+        from src.utils.data_loader import load_input, DataContractError
 
-        tm_df = pd.DataFrame({
-            "TM_ID":    ["34_01", "07_01", "9_9",  "34_01"],
-            "Capacity": [5000,    2500,    3000,    -100],
-        })
-        clean_tm, errors_tm = validate_transfer_centers(tm_df)
-        assert len(clean_tm) == 2, f"2 gecerli TM bekleniyor, gelen={len(clean_tm)}"
-        assert len(errors_tm) >= 2
-        print(f"  OK  TM: {len(clean_tm)} gecerli, {len(errors_tm)} hata")
+        # Gerçek JSON başarılı yüklenmeli
+        data = load_input("data/raw/logiai_mvp_input.json")
+        assert "distance_matrix" in data
+        assert "rental_routes" in data
+        assert "daily_demand" in data
+        print(f"  OK  Gercek JSON yuklendi ({len(data['daily_demand'])} gun, "
+              f"{len(data['distance_matrix'])} sehir)")
 
-        v_df = pd.DataFrame({
-            "Vehicle_ID": ["V001", "V002", "V001"],
-            "Type":       ["Tir",  "UcakTipi", "Kamyon"],
-            "Capacity":   [3000,   1500,        800],
-        })
-        clean_v, errors_v = validate_vehicles(v_df)
-        assert len(errors_v) >= 2
-        print(f"  OK  Arac: {len(clean_v)} gecerli, {len(errors_v)} hata")
+        # Eksik alan → DataContractError
+        bad = {k: v for k, v in data.items() if k != "distance_matrix"}
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(bad, f)
+        try:
+            load_input(path)
+            print("  FAIL  DataContractError bekleniyor")
+            return FAIL
+        except DataContractError:
+            print("  OK  Eksik alan DataContractError fırlattı")
+        finally:
+            os.unlink(path)
 
-        pkgs = [
-            {"pkg_id": "P001", "tm_id": "34_01", "desi": 100},
-            {"pkg_id": "P001", "tm_id": "34_01", "desi": 50},
-            {"pkg_id": "P002", "tm_id": "99_99", "desi": 200},
-            {"pkg_id": "P003", "tm_id": "06_01", "desi": -10},
-            {"pkg_id": "P004", "tm_id": "07_01", "desi": 80},
-        ]
-        clean_pkgs, errors_pkgs = validate_packages(pkgs)
-        assert len(clean_pkgs) == 2, f"2 gecerli paket bekleniyor, gelen={len(clean_pkgs)}"
-        assert len(errors_pkgs) >= 3
-        print(f"  OK  Paket: {len(clean_pkgs)} gecerli, {len(errors_pkgs)} hata")
+        # Dosya yok → DataContractError
+        try:
+            load_input("var_olmayan_dosya_12345.json")
+            return FAIL
+        except DataContractError:
+            print("  OK  Olmayan dosya DataContractError fırlattı")
+
         return PASS
     except Exception as e:
         print(f"  FAIL  {e}")

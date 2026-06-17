@@ -8,6 +8,15 @@ from .config import REDIS_HOST, REDIS_PORT, REDIS_DB
 
 logger = logging.getLogger(__name__)
 
+# Modül düzeyinde paylaşılan tek ConnectionPool — her RedisStateManager()
+# örneği aynı havuzu kullanır, her çağrıda yeni TCP soketi açılmaz.
+_pool = _redis.ConnectionPool(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    db=REDIS_DB,
+    decode_responses=True,
+)
+
 # Araç kapasiteleri — Araç_Kapasite_Maliyet.xlsx gerçek değerleri
 VEHICLE_INFO: Dict[str, Dict] = {
     "KIR_TIR_01":        {"type": "Tır",          "capacity": 22400},
@@ -23,12 +32,7 @@ ECHELON_SECOND = "2"
 
 class RedisStateManager:
     def __init__(self):
-        self.redis: _redis.Redis = _redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            db=REDIS_DB,
-            decode_responses=True,
-        )
+        self.redis: _redis.Redis = _redis.Redis(connection_pool=_pool)
         try:
             self.redis.ping()
         except Exception as exc:
