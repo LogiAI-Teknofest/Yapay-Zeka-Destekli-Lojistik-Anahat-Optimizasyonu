@@ -2,60 +2,11 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-from redis import Redis
+import redis as _redis
 
-from .config import get_redis_client
+from .config import REDIS_HOST, REDIS_PORT, REDIS_DB
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger(__name__)
-
-# ── Sabit Veri — logiai_mvp_input.json'dan türetilmiştir ─────────────────────
-
-TM_MAX_CAP: Dict[str, int] = {
-    "İstanbul":   1092270,
-    "Yalova":      883655,
-    "Tekirdağ":    798424,
-    "Eskişehir":   786932,
-    "Manisa":      775103,
-    "Kocaeli":     539280,
-    "Balıkesir":   510472,
-    "Bilecik":     278304,
-    "Denizli":     250000,
-    "Zonguldak":   200000,
-    "Mersin":      180000,
-    "Mardin":      150000,
-    "Sivas":       140000,
-    "Karaman":     130000,
-    "Isparta":     120000,
-    "Erzincan":    110000,
-    "Kütahya":     100000,
-    "Şanlıurfa":    90000,
-}
-
-# α_i: Tır yanaşma uygunluğu — kiralık rotalarda tır kullanan şehirler
-TM_ACCEPTS_TRUCK: Dict[str, bool] = {
-    "İstanbul":  True,
-    "Yalova":    True,
-    "Tekirdağ":  True,
-    "Eskişehir": True,
-    "Manisa":    True,
-    "Kocaeli":   True,
-    "Balıkesir": True,
-    "Bilecik":   False,
-    "Denizli":   False,
-    "Zonguldak": False,
-    "Mersin":    False,
-    "Mardin":    False,
-    "Sivas":     False,
-    "Karaman":   False,
-    "Isparta":   False,
-    "Erzincan":  False,
-    "Kütahya":   False,
-    "Şanlıurfa": False,
-}
 
 # Araç kapasiteleri — Araç_Kapasite_Maliyet.xlsx gerçek değerleri
 VEHICLE_INFO: Dict[str, Dict] = {
@@ -66,13 +17,18 @@ VEHICLE_INFO: Dict[str, Dict] = {
 }
 
 # 2E-VRP echelon sabitleri (MVP'de sadece SECOND aktif)
-ECHELON_FIRST  = "1"   # küçük araç → TM toplama
-ECHELON_SECOND = "2"   # büyük araç → ana hedef
+ECHELON_FIRST  = "1"
+ECHELON_SECOND = "2"
 
 
 class RedisStateManager:
     def __init__(self):
-        self.redis: Redis = get_redis_client()
+        self.redis: _redis.Redis = _redis.Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            db=REDIS_DB,
+            decode_responses=True,
+        )
         try:
             self.redis.ping()
         except Exception as exc:
@@ -94,17 +50,6 @@ class RedisStateManager:
                 pipe.delete(key)
 
         now = datetime.now().isoformat()
-        for tm_id, max_cap in TM_MAX_CAP.items():
-            pipe.hset(
-                f"TM:{tm_id}:State",
-                mapping={
-                    "MaxCapacity":    max_cap,
-                    "CurrentLoad":    0,
-                    "OverloadAmount": 0,   # δ_i — esnek kisit takibi
-                    "AcceptsTruck":   int(TM_ACCEPTS_TRUCK.get(tm_id, False)),
-                    "UpdatedAt":      now,
-                },
-            )
         for vehicle_id, info in VEHICLE_INFO.items():
             pipe.hset(
                 f"Vehicle:{vehicle_id}:State",
@@ -119,15 +64,39 @@ class RedisStateManager:
         pipe.execute()
         logger.info("Redis durumlari sifirlandi (secici).")
 
+    def load_vehicle_state(self, data: dict) -> None:
+        """rental_routes'taki araçların durumunu JSON'dan Redis'e yükler."""
+        pipe = self.redis.pipeline()
+        now = datetime.now().isoformat()
+        seen: set = set()
+        for route_key, vehicles in data.get("rental_routes", {}).items():
+            for v in vehicles:
+                vid = v["id"]
+                if vid in seen:
+                    continue
+                seen.add(vid)
+                pipe.hset(
+                    f"Vehicle:{vid}:State",
+                    mapping={
+                        "Type":        v.get("vehicle_type", "Tır"),
+                        "MaxCapacity": v["capacity_desi"],
+                        "CurrentLoad": 0,
+                        "Location":    "Depo",
+                        "UpdatedAt":   now,
+                    },
+                )
+        pipe.execute()
+        logger.info("Araç durumları JSON'dan yüklendi (%d araç).", len(seen))
+
     # ── Read ─────────────────────────────────────────────────────────────────
 
     def get_tm_state(self, tm_id: str) -> Dict:
         raw = self.redis.hgetall(f"TM:{tm_id}:State")
         return {
             "tm_id":         tm_id,
-            "max_cap":       int(float(raw.get("MaxCapacity",    TM_MAX_CAP.get(tm_id, 0)))),
+            "max_cap":       int(float(raw.get("MaxCapacity", 0))),
             "current":       float(raw.get("CurrentLoad",   0)),
-            "overload":      float(raw.get("OverloadAmount", 0)),   # δ_i
+            "overload":      float(raw.get("OverloadAmount", 0)),
             "accepts_truck": raw.get("AcceptsTruck", "0") == "1",
             "updated_at":    raw.get("UpdatedAt", "-"),
         }
@@ -145,14 +114,21 @@ class RedisStateManager:
         }
 
     def list_tm_states(self) -> List[Dict]:
-        return [self.get_tm_state(tm_id) for tm_id in TM_MAX_CAP]
+        tm_keys = list(self.redis.scan_iter(match="TM:*:State"))
+        tm_ids = [k.replace("TM:", "").replace(":State", "") for k in tm_keys]
+        return [self.get_tm_state(tm_id) for tm_id in tm_ids]
 
     def list_vehicle_states(self) -> List[Dict]:
         return [self.get_vehicle_state(v) for v in VEHICLE_INFO]
 
     def get_total_overload(self) -> float:
         """Tum TM'lerin toplam delta_i asim miktari."""
-        return sum(self.get_tm_state(tm_id)["overload"] for tm_id in TM_MAX_CAP)
+        total = 0.0
+        for key in self.redis.scan_iter(match="TM:*:State"):
+            raw = self.redis.hget(key, "OverloadAmount")
+            if raw:
+                total += float(raw)
+        return total
 
     # ── Load ─────────────────────────────────────────────────────────────────
 
@@ -186,7 +162,7 @@ class RedisStateManager:
 
         # TM elleçleme — esnek kisit (delta_i)
         new_tm_load = tm_state["current"] + desi
-        if new_tm_load > tm_state["max_cap"]:
+        if tm_state["max_cap"] > 0 and new_tm_load > tm_state["max_cap"]:
             overload_delta = new_tm_load - tm_state["max_cap"]
             pipe.hincrbyfloat(tm_key, "OverloadAmount", overload_delta)
 

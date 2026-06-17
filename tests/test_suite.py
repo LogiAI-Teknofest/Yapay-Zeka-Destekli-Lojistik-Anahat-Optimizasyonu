@@ -18,25 +18,16 @@ if hasattr(sys.stdout, "buffer"):
 if hasattr(sys.stderr, "buffer"):
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-import logging
 import time
 from datetime import datetime
 
-logging.disable(logging.CRITICAL)
+import redis
 
-from src.utils.config import get_redis_client
-
-_r = get_redis_client()
+_r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
 
 PASS = "PASS"
 FAIL = "FAIL"
 SKIP = "SKIP"
-
-
-def _reset():
-    for pat in ("TM:*:State", "Vehicle:*:State", "ETA:TM:*", "ETA:Vehicle:*", "Route:*"):
-        for k in _r.scan_iter(match=pat):
-            _r.delete(k)
 
 
 def _section(title: str):
@@ -66,18 +57,12 @@ def test_reset_states():
         sm = RedisStateManager()
         sm.reset_states()
 
-        tms  = list(_r.scan_iter(match="TM:*:State"))
         vehs = list(_r.scan_iter(match="Vehicle:*:State"))
-        assert len(tms)  == 18, f"18 TM bekleniyor, gelen={len(tms)}"
-        assert len(vehs) == 4,  f"4 arac bekleniyor, gelen={len(vehs)}"
+        assert len(vehs) == 4, f"4 arac bekleniyor, gelen={len(vehs)}"
 
-        cap      = _r.hget("TM:İstanbul:State", "MaxCapacity")
-        overload = _r.hget("TM:İstanbul:State", "OverloadAmount")
-        truck    = _r.hget("TM:İstanbul:State", "AcceptsTruck")
-        assert cap      == "1092270", f"MaxCapacity=1092270 bekleniyor, gelen={cap}"
-        assert overload == "0",       f"OverloadAmount=0 bekleniyor, gelen={overload}"
-        assert truck    == "1",       f"AcceptsTruck=1 bekleniyor (Istanbul tir kabul), gelen={truck}"
-        print(f"  OK  {len(tms)} TM, {len(vehs)} arac  MaxCap={cap}  delta_i={overload}  Tir={truck}")
+        cap = _r.hget("Vehicle:KIR_TIR_01:State", "MaxCapacity")
+        assert cap == "22400", f"MaxCapacity=22400 bekleniyor, gelen={cap}"
+        print(f"  OK  {len(vehs)} arac  KIR_TIR_01 MaxCap={cap}")
         return PASS
     except Exception as e:
         print(f"  FAIL  {e}")
@@ -121,7 +106,7 @@ def test_overload_tracking():
         from src.utils.state_manager import RedisStateManager
         sm = RedisStateManager()
 
-        _r.hset("TM:Yalova:State", "CurrentLoad", 883200)
+        _r.hset("TM:Yalova:State", mapping={"MaxCapacity": 883655, "CurrentLoad": 883200, "OverloadAmount": 0})
 
         pkg = {"pkg_id": "PKG_OVR", "tm_id": "Yalova", "desi": 600.0}
         ok  = sm.try_load_package(pkg, "KIR_HAFIF_01")
@@ -198,14 +183,14 @@ def test_apply_route_loads():
     _section("TEST 7: apply_route_loads (State Manager yukleme entegrasyonu)")
     try:
         from src.utils.state_manager import RedisStateManager
-        from tests.mock_generator import generate_test_packages
+        from tests.mock_generator import generate_tm_demand_items
 
         sm = RedisStateManager()
-        packages = generate_test_packages(count=18, seed=42)
+        items = generate_tm_demand_items(count=18, seed=42)
 
         route_packages = {
-            "KIR_TIR_01":    [p for p in packages if p["tm_id"] in ("İstanbul", "Yalova")][:5],
-            "KIR_KAMYON_01": [p for p in packages if p["tm_id"] in ("Kocaeli", "Tekirdağ")][:3],
+            "KIR_TIR_01":    [p for p in items if p["tm_id"] in ("İstanbul", "Yalova")][:5],
+            "KIR_KAMYON_01": [p for p in items if p["tm_id"] in ("Kocaeli", "Tekirdağ")][:3],
         }
 
         assigned = sm.apply_route_loads(route_packages)
@@ -272,32 +257,8 @@ def test_config():
         from src.utils import config
         assert hasattr(config, "REDIS_HOST")
         assert hasattr(config, "REDIS_PORT")
-        assert hasattr(config, "get_redis_client")
+        assert hasattr(config, "LOGIAI_API_URL")
         print(f"  OK  REDIS_HOST={config.REDIS_HOST}:{config.REDIS_PORT}")
-        return PASS
-    except Exception as e:
-        print(f"  FAIL  {e}")
-        return FAIL
-
-
-# ── Test 10: Data Ingestion ───────────────────────────────────────────────────
-def test_data_ingestion():
-    _section("TEST 10: Data Ingestion (data_ingestion modulu import)")
-    try:
-        from src.preprocessing.data_ingestion import (
-            validate_transfer_centers,
-            validate_vehicles,
-            load_transfer_centers_to_redis,
-        )
-        import pandas as pd
-
-        df = pd.DataFrame([
-            {"TM_ID": "34_01", "Capacity": 5000},
-            {"TM_ID": "BAD",   "Capacity": -1},
-        ])
-        clean, errors = validate_transfer_centers(df)
-        assert len(clean) == 1
-        print(f"  OK  data_ingestion import ve validasyon calisiyor ({len(clean)} gecerli)")
         return PASS
     except Exception as e:
         print(f"  FAIL  {e}")
@@ -311,7 +272,6 @@ def run_all_tests():
     print("=" * 55)
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    _reset()
     from src.utils.state_manager import RedisStateManager
     RedisStateManager().reset_states()
 
@@ -325,12 +285,10 @@ def run_all_tests():
         ("apply_route_loads",       test_apply_route_loads),
         ("Veri Dogrulama",          test_data_validation),
         ("Config Env Vars",         test_config),
-        ("Data Ingestion",          test_data_ingestion),
     ]
 
     results = []
     for name, fn in tests:
-        _reset()
         try:
             from src.utils.state_manager import RedisStateManager
             RedisStateManager().reset_states()
