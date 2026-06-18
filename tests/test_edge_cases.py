@@ -1,14 +1,16 @@
 """
-LogiAI — Veri Validasyon Stres Testi (Kisi C)
-data_validation modülünü kasitli bozuk verilerle test eder.
+LogiAI — Veri Yükleme Stres Testi (Kisi C)
+data_loader modülünü kasitli bozuk JSON verisiyle test eder.
 Proje kök dizininden çalıştır: python tests/test_edge_cases.py
 """
 
+import copy
 import io
+import json
 import os
 import sys
+import tempfile
 
-# Proje kök dizinini sys.path'e ekle
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
@@ -20,19 +22,26 @@ if hasattr(sys.stderr, "buffer"):
 
 import logging
 
-import pandas as pd
-
-from src.preprocessing.data_validation import (
-    validate_transfer_centers,
-    validate_vehicles,
-    validate_packages,
-    MAX_SINGLE_DESI,
-)
-
 logging.basicConfig(
     level=logging.WARNING,
     format="%(levelname)s [%(name)s]: %(message)s",
 )
+
+# Minimum geçerli sözleşme — her test kendi bozuk kopyasını üretir
+_BASE = {
+    "vehicles_info":   {"Tır": {"name": "Tır", "capacity_desi": 22400}},
+    "distance_matrix": {"A": {"B": 100.0}},
+    "cost_matrix": {"A": {"B": {"Tır": {"kiralik": 500.0, "spot": 600.0}}}},
+    "rental_routes": {"A_B": [{"id": "KIR_TIR_01", "vehicle_type": "Tır", "capacity_desi": 22400}]},
+    "daily_demand": {"2026-05-23": {"A": {"B": 500.0}}},
+}
+
+
+def _write_tmp(data: dict) -> str:
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    return path
 
 
 def _header(title: str):
@@ -41,167 +50,105 @@ def _header(title: str):
     print("=" * 60)
 
 
-def _print_errors(errors):
-    if not errors:
-        print("  [Hata yok]")
-        return
-    for err in errors:
-        print(f"  [HATA]  {err}")
+# ── Senaryo 1: Eksik / Bozuk Üst Düzey Alan ──────────────────────────────────
 
+def test_eksik_alan():
+    from src.utils.data_loader import load_input, DataContractError
 
-def _result_line(label: str, gecerli: int, hata: int):
-    status = "OK" if gecerli >= 0 else "??"
-    print(f"\n  [{status}]  Gecerli: {gecerli}  |  Yakalanan hata: {hata}")
-    print(f"        -> {label}")
+    _header("SENARYO 1: Eksik / Bozuk Üst Düzey Alan")
 
-
-# ── Senaryo 1: Bozuk TM Verisi ────────────────────────────────────────────────
-
-def test_bozuk_tm_verisi():
-    _header("SENARYO 1: Bozuk TM (Transfer Merkezi) Verisi")
-
-    print("\n  [1a] Format hatasi + negatif kapasite + duplikat")
-    df = pd.DataFrame([
-        {"TM_ID": "34_01",      "Capacity": 5000},   # GECERLI
-        {"TM_ID": "INVALID_ID", "Capacity": 3000},   # Hata: XX_XX formati degil
-        {"TM_ID": "06_01",      "Capacity": -500},   # Hata: negatif kapasite
-        {"TM_ID": "07_01",      "Capacity": 0},      # Hata: sifir kapasite
-        {"TM_ID": "34_01",      "Capacity": 4000},   # Hata: duplikat TM_ID
-    ])
-    clean, errors = validate_transfer_centers(df)
-    _print_errors(errors)
-    _result_line("Sadece '34_01' (5000) gecmeli", len(clean), len(errors))
-    assert len(clean)  == 1, f"1 gecerli TM bekleniyor, gelen={len(clean)}"
-    assert len(errors) == 4, f"4 hata bekleniyor, gelen={len(errors)}"
-
-    print("\n  [1b] Eksik zorunlu sutun ('Capacity' yok)")
-    df_eksik = pd.DataFrame([{"TM_ID": "34_01"}, {"TM_ID": "07_01"}])
+    print("\n  [1a] Zorunlu alan eksik ('distance_matrix' yok)")
+    data = {k: v for k, v in _BASE.items() if k != "distance_matrix"}
+    path = _write_tmp(data)
     try:
-        validate_transfer_centers(df_eksik)
-        print("  [FAIL]  ValueError bekleniyor ama firlatilmadi!")
-    except ValueError as e:
-        print(f"  [OK]  ValueError dogru yakalandi: {e}")
+        load_input(path)
+        print("  [FAIL]  DataContractError bekleniyor ama firlatilmadi!")
+        assert False
+    except DataContractError as e:
+        print(f"  [OK]  DataContractError dogru yakalandi: {e}")
+    finally:
+        os.unlink(path)
 
-    print("\n  [1c] Tamamen bos DataFrame")
-    df_bos = pd.DataFrame(columns=["TM_ID", "Capacity"])
-    clean_bos, errors_bos = validate_transfer_centers(df_bos)
-    assert len(clean_bos) == 0 and len(errors_bos) == 0
-    print(f"  [OK]  Bos DataFrame hata firlatmadi: {len(clean_bos)} gecerli, {len(errors_bos)} hata")
-
-    print("\n  [1d] NaN kapasite")
-    df_nan = pd.DataFrame([
-        {"TM_ID": "35_01", "Capacity": 3000},
-        {"TM_ID": "07_01", "Capacity": None},
-    ])
-    clean_nan, errors_nan = validate_transfer_centers(df_nan)
-    _print_errors(errors_nan)
-    _result_line("Sadece '35_01' gecmeli", len(clean_nan), len(errors_nan))
-    assert len(clean_nan)  == 1
-    assert len(errors_nan) == 1
-
-
-# ── Senaryo 2: Bozuk Arac Verisi ─────────────────────────────────────────────
-
-def test_bozuk_arac_verisi():
-    _header("SENARYO 2: Bozuk Arac Verisi")
-
-    print("\n  [2a] Gecersiz tip + negatif kapasite + duplikat")
-    df = pd.DataFrame([
-        {"Vehicle_ID": "V001", "Type": "Tir",          "Capacity": 3000},  # GECERLI
-        {"Vehicle_ID": "V002", "Type": "UcakTipi",     "Capacity": 1500},  # Hata: gecersiz tip
-        {"Vehicle_ID": "V003", "Type": "Kamyon",       "Capacity": -200},  # Hata: negatif
-        {"Vehicle_ID": "V004", "Type": "Kamyonet",     "Capacity": 0},     # Hata: sifir
-        {"Vehicle_ID": "V001", "Type": "Hafif Kamyon", "Capacity": 800},   # Hata: duplikat
-    ])
-    clean, errors = validate_vehicles(df)
-    _print_errors(errors)
-    _result_line("Sadece V001 (Tir) gecmeli", len(clean), len(errors))
-    assert len(clean)  == 1, f"1 gecerli arac bekleniyor, gelen={len(clean)}"
-    assert len(errors) == 4, f"4 hata bekleniyor, gelen={len(errors)}"
-
-    print("\n  [2b] Eksik zorunlu sutun ('Type' yok)")
-    df_eksik = pd.DataFrame([{"Vehicle_ID": "V001", "Capacity": 3000}])
+    print("\n  [1b] Bozuk JSON sözdizimi")
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("{bozuk: json, verisi")
     try:
-        validate_vehicles(df_eksik)
-        print("  [FAIL]  KeyError bekleniyor ama firlatilmadi!")
-    except (KeyError, Exception) as e:
-        print(f"  [OK]  Hata dogru yakalandi: {type(e).__name__}: {e}")
+        load_input(path)
+        print("  [FAIL]  DataContractError bekleniyor ama firlatilmadi!")
+        assert False
+    except DataContractError as e:
+        print(f"  [OK]  Bozuk JSON DataContractError dogru yakalandi: {e}")
+    finally:
+        os.unlink(path)
+
+    print("\n  [1c] Dosya yok")
+    try:
+        load_input("/tmp/var_olmayan_logiai_12345.json")
+        print("  [FAIL]  DataContractError bekleniyor ama firlatilmadi!")
+        assert False
+    except DataContractError as e:
+        print(f"  [OK]  Olmayan dosya DataContractError dogru yakalandi: {e}")
 
 
-# ── Senaryo 3: Bozuk Paket Verisi ─────────────────────────────────────────────
+# ── Senaryo 2: Bozuk İç Yapı ve Tutarsız Veri ────────────────────────────────
 
-def test_bozuk_paket_verisi():
-    _header("SENARYO 3: Bozuk Paket Verisi")
+def test_bozuk_ic_yapi():
+    from src.utils.data_loader import load_input, DataContractError
 
-    print("\n  [3a] Tum bozuk desi turleri")
-    packages = [
-        {"pkg_id": "PKG_001", "tm_id": "34_01", "desi": 50},      # GECERLI
-        {"pkg_id": "PKG_002", "tm_id": "34_01", "desi": "Yuz"},   # Hata: string desi
-        {"pkg_id": "PKG_003", "tm_id": "34_01", "desi": 0},        # Hata: sifir desi
-        {"pkg_id": "PKG_004", "tm_id": "34_01", "desi": -10},      # Hata: negatif desi
-        {"pkg_id": "PKG_005", "tm_id": "34_01", "desi": 999999},   # Hata: astronomik
-        {"pkg_id": "PKG_006", "tm_id": "34_01", "desi": 120},      # GECERLI
-    ]
-    clean, errors = validate_packages(packages)
-    _print_errors(errors)
-    _result_line("PKG_001 ve PKG_006 gecmeli", len(clean), len(errors))
-    assert len(clean)  == 2, f"2 gecerli paket bekleniyor, gelen={len(clean)}"
-    assert len(errors) == 4, f"4 hata bekleniyor, gelen={len(errors)}"
+    _header("SENARYO 2: Bozuk İç Yapı ve Mantıksal Tutarsızlık")
 
-    print("\n  [3b] Tanimsiz TM_ID")
-    pkgs_bad_tm = [
-        {"pkg_id": "P001", "tm_id": "34_01", "desi": 80},
-        {"pkg_id": "P002", "tm_id": "99_99", "desi": 100},
-        {"pkg_id": "P003", "tm_id": None,    "desi": 50},
-    ]
-    clean2, errors2 = validate_packages(pkgs_bad_tm)
-    _print_errors(errors2)
-    _result_line("Sadece P001 gecmeli", len(clean2), len(errors2))
-    assert len(clean2)  == 1
-    assert len(errors2) >= 2
+    print("\n  [2a] distance_matrix'te negatif mesafe")
+    data = copy.deepcopy(_BASE)
+    data["distance_matrix"]["A"]["B"] = -50.0
+    path = _write_tmp(data)
+    try:
+        load_input(path)
+        print("  [FAIL]  DataContractError bekleniyor ama firlatilmadi!")
+        assert False
+    except DataContractError as e:
+        print(f"  [OK]  Negatif mesafe yakalandi: {e}")
+    finally:
+        os.unlink(path)
 
-    print("\n  [3c] Duplikat pkg_id")
-    pkgs_dupe = [
-        {"pkg_id": "PKG_A", "tm_id": "06_01", "desi": 100},  # GECERLI
-        {"pkg_id": "PKG_A", "tm_id": "06_01", "desi": 200},  # Hata: duplikat
-        {"pkg_id": "PKG_B", "tm_id": "07_01", "desi": 50},   # GECERLI
-    ]
-    clean3, errors3 = validate_packages(pkgs_dupe)
-    _print_errors(errors3)
-    _result_line("PKG_A (ilk) ve PKG_B gecmeli", len(clean3), len(errors3))
-    assert len(clean3)  == 2
-    assert len(errors3) == 1
+    print("\n  [2b] rental_routes'ta gecersiz anahtar formati ('_' yok)")
+    data2 = copy.deepcopy(_BASE)
+    data2["rental_routes"]["GECERSIZANAHTAR"] = [{"id": "KIR_TIR_99", "capacity_desi": 100}]
+    path2 = _write_tmp(data2)
+    try:
+        load_input(path2)
+        print("  [FAIL]  DataContractError bekleniyor ama firlatilmadi!")
+        assert False
+    except DataContractError as e:
+        print(f"  [OK]  Gecersiz rota anahtari yakalandi: {e}")
+    finally:
+        os.unlink(path2)
 
-    print(f"\n  [3d] MAX_SINGLE_DESI siniri = {MAX_SINGLE_DESI} desi")
-    limit_pkg = [
-        {"pkg_id": "P_MAX",  "tm_id": "34_01", "desi": MAX_SINGLE_DESI},
-        {"pkg_id": "P_OVER", "tm_id": "34_01", "desi": MAX_SINGLE_DESI + 1},
-    ]
-    clean4, errors4 = validate_packages(limit_pkg)
-    _print_errors(errors4)
-    assert len(clean4)  == 1, f"Sadece P_MAX gecmeli, gelen={len(clean4)}"
-    assert len(errors4) == 1
-    print(f"  [OK]  {MAX_SINGLE_DESI} desi gecti, {MAX_SINGLE_DESI + 1} desi reddedildi")
-
-    print("\n  [3e] Tamamen bos paket listesi")
-    clean5, errors5 = validate_packages([])
-    assert len(clean5) == 0 and len(errors5) == 0
-    print("  [OK]  Bos liste hata firlatmadi")
+    print("\n  [2c] daily_demand'da distance_matrix'te olmayan sehir (coherence)")
+    data3 = copy.deepcopy(_BASE)
+    data3["daily_demand"]["2026-05-23"]["BILINMEYEN_SEHIR"] = {"B": 100.0}
+    path3 = _write_tmp(data3)
+    try:
+        load_input(path3)
+        print("  [FAIL]  DataContractError bekleniyor ama firlatilmadi!")
+        assert False
+    except DataContractError as e:
+        print(f"  [OK]  Tutarsiz sehir yakalandi: {e}")
+    finally:
+        os.unlink(path3)
 
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 def run_stress_test():
     print("\n" + "=" * 60)
-    print("  LogiAI — Veri Validasyon Stres Testi")
-    print("  src.preprocessing.data_validation ::")
-    print("    validate_transfer_centers, validate_vehicles, validate_packages")
+    print("  LogiAI — Veri Yükleme Stres Testi")
+    print("  src.utils.data_loader :: load_input, DataContractError")
     print("=" * 60)
 
     senaryolar = [
-        ("Bozuk TM Verisi",    test_bozuk_tm_verisi),
-        ("Bozuk Arac Verisi",  test_bozuk_arac_verisi),
-        ("Bozuk Paket Verisi", test_bozuk_paket_verisi),
+        ("Eksik / Bozuk Ust Duzey Alan",    test_eksik_alan),
+        ("Bozuk Ic Yapi ve Tutarsizlik",     test_bozuk_ic_yapi),
     ]
 
     basarili, basarisiz = [], []
