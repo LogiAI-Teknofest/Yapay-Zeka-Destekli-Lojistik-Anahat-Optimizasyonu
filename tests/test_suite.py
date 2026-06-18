@@ -1,6 +1,6 @@
 """
 LogiAI — MVP Test Suite (Kisi C)
-state_manager, data_validation modüllerini test eder.
+state_manager, data_loader modüllerini test eder.
 Proje kök dizininden çalıştır: python tests/test_suite.py
 """
 
@@ -49,16 +49,21 @@ def test_redis_connection():
         return FAIL
 
 
-# ── Test 2: reset_states ──────────────────────────────────────────────────────
+# ── Test 2: reset_states + load_vehicle_state ────────────────────────────────
 def test_reset_states():
-    _section("TEST 2: reset_states (Secici Redis Sifirlama)")
+    _section("TEST 2: reset_states + load_vehicle_state (SSoT — JSON'dan yükleme)")
     try:
+        from src.utils.data_loader import load_input
         from src.utils.state_manager import RedisStateManager
         sm = RedisStateManager()
         sm.reset_states()
 
+        # reset_states artık Vehicle key oluşturmuyor; load_vehicle_state çağrılmalı
+        data = load_input("data/raw/logiai_mvp_input.json")
+        sm.load_vehicle_state(data)
+
         vehs = list(_r.scan_iter(match="Vehicle:*:State"))
-        assert len(vehs) == 4, f"4 arac bekleniyor, gelen={len(vehs)}"
+        assert len(vehs) >= 1, f"En az 1 arac bekleniyor, gelen={len(vehs)}"
 
         cap = _r.hget("Vehicle:KIR_TIR_01:State", "MaxCapacity")
         assert cap == "22400", f"MaxCapacity=22400 bekleniyor, gelen={cap}"

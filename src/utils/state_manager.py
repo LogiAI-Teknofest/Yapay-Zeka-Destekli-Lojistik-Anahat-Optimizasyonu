@@ -17,14 +17,6 @@ _pool = _redis.ConnectionPool(
     decode_responses=True,
 )
 
-# Araç kapasiteleri — Araç_Kapasite_Maliyet.xlsx gerçek değerleri
-VEHICLE_INFO: Dict[str, Dict] = {
-    "KIR_TIR_01":        {"type": "Tır",          "capacity": 22400},
-    "KIR_KAMYON_01":     {"type": "Kamyon",        "capacity": 12000},
-    "KIR_HAFIF_01":      {"type": "Hafif Kamyon",  "capacity": 7200},
-    "KIR_KAMYONET_01":   {"type": "Kamyonet",      "capacity": 5600},
-}
-
 # 2E-VRP echelon sabitleri (MVP'de sadece SECOND aktif)
 ECHELON_FIRST  = "1"
 ECHELON_SECOND = "2"
@@ -53,37 +45,35 @@ class RedisStateManager:
             for key in self.redis.scan_iter(match=pat):
                 pipe.delete(key)
 
-        now = datetime.now().isoformat()
-        for vehicle_id, info in VEHICLE_INFO.items():
-            pipe.hset(
-                f"Vehicle:{vehicle_id}:State",
-                mapping={
-                    "Type":        info["type"],
-                    "MaxCapacity": info["capacity"],
-                    "CurrentLoad": 0,
-                    "Location":    "Depo",
-                    "UpdatedAt":   now,
-                },
-            )
         pipe.execute()
-        logger.info("Redis durumlari sifirlandi (secici).")
+        logger.info("Redis durumlari sifirlandi (secici). Arac durumları icin load_vehicle_state() cagirilmali.")
 
     def load_vehicle_state(self, data: dict) -> None:
-        """rental_routes'taki araçların durumunu JSON'dan Redis'e yükler."""
+        """
+        rental_routes'taki araç örneklerini Redis'e yükler.
+        Kapasite bilgisi vehicles_info'dan alınır; bu sayede VEHICLE_INFO
+        hardcoded sabitine bağımlılık kalmaz (Kural 7 — SSoT).
+        """
+        vehicles_info = data.get("vehicles_info", {})
         pipe = self.redis.pipeline()
         now = datetime.now().isoformat()
         seen: set = set()
-        for route_key, vehicles in data.get("rental_routes", {}).items():
+        for vehicles in data.get("rental_routes", {}).values():
             for v in vehicles:
                 vid = v["id"]
                 if vid in seen:
                     continue
                 seen.add(vid)
+                vtype = v.get("vehicle_type", "")
+                capacity = (
+                    vehicles_info.get(vtype, {}).get("capacity_desi")
+                    or v.get("capacity_desi", 0)
+                )
                 pipe.hset(
                     f"Vehicle:{vid}:State",
                     mapping={
-                        "Type":        v.get("vehicle_type", "Tır"),
-                        "MaxCapacity": v["capacity_desi"],
+                        "Type":        vtype,
+                        "MaxCapacity": capacity,
                         "CurrentLoad": 0,
                         "Location":    "Depo",
                         "UpdatedAt":   now,
@@ -107,11 +97,10 @@ class RedisStateManager:
 
     def get_vehicle_state(self, vehicle_id: str) -> Dict:
         raw = self.redis.hgetall(f"Vehicle:{vehicle_id}:State")
-        info = VEHICLE_INFO.get(vehicle_id, {"type": "Bilinmiyor", "capacity": 1})
         return {
             "vehicle_id": vehicle_id,
-            "type":       raw.get("Type", info["type"]),
-            "max_cap":    int(float(raw.get("MaxCapacity", info["capacity"]))),
+            "type":       raw.get("Type", "Bilinmiyor"),
+            "max_cap":    int(float(raw.get("MaxCapacity", 1))),
             "current":    float(raw.get("CurrentLoad", 0)),
             "location":   raw.get("Location", "Depo"),
             "updated_at": raw.get("UpdatedAt", "-"),
@@ -123,7 +112,9 @@ class RedisStateManager:
         return [self.get_tm_state(tm_id) for tm_id in tm_ids]
 
     def list_vehicle_states(self) -> List[Dict]:
-        return [self.get_vehicle_state(v) for v in VEHICLE_INFO]
+        vehicle_keys = list(self.redis.scan_iter(match="Vehicle:*:State"))
+        vehicle_ids = [k.replace("Vehicle:", "").replace(":State", "") for k in vehicle_keys]
+        return [self.get_vehicle_state(vid) for vid in vehicle_ids]
 
     def get_total_overload(self) -> float:
         """Tum TM'lerin toplam delta_i asim miktari."""
