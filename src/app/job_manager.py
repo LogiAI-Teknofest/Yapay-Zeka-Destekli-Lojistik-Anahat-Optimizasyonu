@@ -10,19 +10,29 @@ TTL: 1 saat (3600 sn) — job tamamlanmış olsa bile sonuç o süre Redis'te ka
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
 
 import redis
 
+logger = logging.getLogger(__name__)
+
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
 _JOB_PREFIX  = "logiai:job:"
 _DATE_PREFIX = "logiai:date:"
 _JOB_TTL = 3600
+_MAX_RETRIES = 3  # _patch() optimistic retry sayısı
 
-_pool = redis.ConnectionPool(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+# FIX #47 — max_connections eklendi
+_pool = redis.ConnectionPool(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    decode_responses=True,
+    max_connections=20,
+)
 
 
 def _client() -> redis.Redis:
@@ -34,61 +44,120 @@ def _now() -> str:
 
 
 def _patch(job_id: str, updates: dict) -> None:
-    r = _client()
+    """
+    FIX #14 — Atomik WATCH/MULTI/EXEC pipeline ile race condition giderildi.
+    Önceki Read-Modify-Write zinciri aynı anda iki worker tarafından bozulabiliyordu.
+    """
     key = f"{_JOB_PREFIX}{job_id}"
-    raw = r.get(key)
-    if raw is None:
-        return
-    data = json.loads(raw)
-    data.update(updates)
-    r.setex(key, _JOB_TTL, json.dumps(data))
+    r = _client()
+    for attempt in range(_MAX_RETRIES):
+        try:
+            with r.pipeline() as pipe:
+                pipe.watch(key)
+                raw = pipe.get(key)
+                if raw is None:
+                    pipe.unwatch()
+                    return
+                data = json.loads(raw)
+                data.update(updates)
+                pipe.multi()
+                pipe.setex(key, _JOB_TTL, json.dumps(data))
+                pipe.execute()
+                return  # başarılı
+        except redis.WatchError:
+            # Başka bir worker aynı anda yazdı — yeniden dene
+            logger.debug("_patch WatchError (attempt %d/%d) job_id=%s", attempt + 1, _MAX_RETRIES, job_id)
+            continue
+        except redis.RedisError as exc:  # FIX #41
+            logger.error("Redis error in _patch: %s", exc)
+            return
+    logger.warning("_patch: max retries (%d) aşıldı, job_id=%s", _MAX_RETRIES, job_id)
 
 
 # ── Durum geçişleri ──────────────────────────────────────────────────────────
 
 def create_job() -> str:
+    """FIX #41 — RedisError koruması eklendi."""
     job_id = str(uuid.uuid4())
-    _client().setex(
-        f"{_JOB_PREFIX}{job_id}",
-        _JOB_TTL,
-        json.dumps({
-            "status": "PENDING",
-            "created_at": _now(),
-            "started_at": None,
-            "finished_at": None,
-            "result": None,
-            "error": None,
-        }),
-    )
+    try:
+        _client().setex(
+            f"{_JOB_PREFIX}{job_id}",
+            _JOB_TTL,
+            json.dumps({
+                "status": "PENDING",
+                "created_at": _now(),
+                "started_at": None,
+                "finished_at": None,
+                "result": None,
+                "error": None,
+            }),
+        )
+    except redis.RedisError as exc:
+        logger.error("Redis error in create_job: %s", exc)
     return job_id
 
 
 def set_running(job_id: str) -> None:
-    _patch(job_id, {"status": "RUNNING", "started_at": _now()})
+    """FIX #41 — RedisError koruması eklendi."""
+    try:
+        _patch(job_id, {"status": "RUNNING", "started_at": _now()})
+    except redis.RedisError as exc:
+        logger.error("Redis error in set_running: %s", exc)
 
 
 def set_completed(job_id: str, result: dict) -> None:
-    _patch(job_id, {"status": "COMPLETED", "finished_at": _now(), "result": result})
-    # Tarih → job_id indexi: /api/fleet gibi endpoint'ler tarihe göre sonucu bulabilsin
-    date = result.get("date")
-    if date:
-        _client().setex(f"{_DATE_PREFIX}{date}", _JOB_TTL, job_id)
+    """
+    FIX #13 — Tarih bazlı indeks artık eski job'ı silmek yerine RPUSH ile
+    listenin sonuna ekleniyor. En son tamamlanan job her zaman listenin sonu.
+    FIX #41 — RedisError koruması eklendi.
+    """
+    try:
+        _patch(job_id, {"status": "COMPLETED", "finished_at": _now(), "result": result})
+        date = result.get("date")
+        if date:
+            r = _client()
+            list_key = f"{_DATE_PREFIX}{date}"
+            # RPUSH: listeye ekle (override yok), ardından TTL tazele
+            r.rpush(list_key, job_id)
+            r.expire(list_key, _JOB_TTL)
+    except redis.RedisError as exc:
+        logger.error("Redis error in set_completed: %s", exc)
 
 
 def set_failed(job_id: str, error: str) -> None:
-    _patch(job_id, {"status": "FAILED", "finished_at": _now(), "error": error})
+    """FIX #41 — RedisError koruması eklendi."""
+    try:
+        _patch(job_id, {"status": "FAILED", "finished_at": _now(), "error": error})
+    except redis.RedisError as exc:
+        logger.error("Redis error in set_failed: %s", exc)
 
 
 # ── Sorgu ────────────────────────────────────────────────────────────────────
 
 def get_job(job_id: str) -> dict | None:
-    raw = _client().get(f"{_JOB_PREFIX}{job_id}")
-    return json.loads(raw) if raw else None
+    """FIX #41 — RedisError koruması eklendi."""
+    try:
+        raw = _client().get(f"{_JOB_PREFIX}{job_id}")
+        return json.loads(raw) if raw else None
+    except redis.RedisError as exc:
+        logger.error("Redis error in get_job: %s", exc)
+        return None
 
 
 def get_job_for_date(date: str) -> dict | None:
-    """Verilen tarih için en son tamamlanmış job'u döner."""
-    job_id = _client().get(f"{_DATE_PREFIX}{date}")
-    if not job_id:
+    """
+    Verilen tarih için en son tamamlanmış job'u döner.
+    FIX #13 — LINDEX -1 ile listenin son (en güncel) elemanı alınıyor.
+    FIX #41 — RedisError koruması eklendi.
+    """
+    try:
+        r = _client()
+        list_key = f"{_DATE_PREFIX}{date}"
+        # En son eklenen job_id (listenin sonu)
+        job_id = r.lindex(list_key, -1)
+        if not job_id:
+            return None
+        return get_job(job_id)
+    except redis.RedisError as exc:
+        logger.error("Redis error in get_job_for_date: %s", exc)
         return None
-    return get_job(job_id)
