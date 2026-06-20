@@ -1,15 +1,15 @@
 """
-FastAPI Gateway — Lojistik Optimizasyon Sistemi
-Person D: Sistem Mimarı ve Arayüz Geliştiricisi
+FastAPI Gateway - Lojistik Optimizasyon Sistemi
+Person D: Sistem Mimari ve Arayuz Gelistiricisi
 
-Modüller:
-- /api/optimize        → OR-Tools rota optimizasyonu (SYNC — deprecated, BackgroundTasks kullan)
-- /api/optimize/async  → Arka plan async optimizasyon (tercih edilen)
-- /api/predict         → LSTM talep tahmini (placeholder)
-- /api/fleet           → Filo atama durumu
-- /api/tm-status       → Transfer merkezi kapasite izleme
-- /api/excel           → Excel çıktı üretimi
-- /api/demand          → Sayfalı talep verisi
+Moduller:
+- /api/optimize        -> OR-Tools rota optimizasyonu (SYNC - deprecated, BackgroundTasks kullan)
+- /api/optimize/async  -> Arka plan async optimizasyon (tercih edilen)
+- /api/predict         -> LSTM talep tahmini (placeholder)
+- /api/fleet           -> Filo atama durumu
+- /api/tm-status       -> Transfer merkezi kapasite izleme
+- /api/excel           -> Excel cikti uretimi
+- /api/demand          -> Sayfali talep verisi
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import math
 import os
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Optional
@@ -35,7 +34,7 @@ from pydantic import ConfigDict
 
 logger = logging.getLogger(__name__)
 
-# Proje kök dizinini sys.path'e ekle (container içinde src/ doğrudan erişilebilir)
+# Proje kok dizinini sys.path'e ekle (container icinde src/ dogrudan erisilebilir)
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _SRC_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _PROJECT_ROOT not in sys.path:
@@ -47,22 +46,23 @@ from main import run_pipeline, result_to_dict
 from utils.data_loader import load_input as _load_input_raw, available_dates, DataContractError
 from app.job_manager import create_job, set_running, set_completed, set_failed, get_job as _get_job, get_job_for_date as _get_job_for_date
 
-# FIX #10 — ThreadPool + Semaphore
+# FIX #10 - Eszamanli is sayisi sinirlama (semaphore).
+# NOT: Worker'lar FastAPI BackgroundTasks ile calistirilir; ayri bir
+# ThreadPoolExecutor kullanilmaz (onceki olu _executor kaldirildi).
 _MAX_CONCURRENT_JOBS = 4
-_executor = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_JOBS)
 _semaphore = threading.Semaphore(_MAX_CONCURRENT_JOBS)
 
 app = FastAPI(
     title="Lojistik Optimizasyon API",
-    description="Teknofest LogiAI — Karar Destek Sistemi Backend",
+    description="Teknofest LogiAI - Karar Destek Sistemi Backend",
     version="1.0.0",
     default_response_class=ORJSONResponse,  # FIX #37
 )
 
-# FIX #38 — GZip sıkıştırma
+# FIX #38 - GZip sikistirma
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# FIX #5 — CORS allow_origins env var'dan (production'da kısıtlı)
+# FIX #5 - CORS allow_origins env var'dan (production'da kisitli)
 _allowed_origins = os.environ.get(
     "ALLOWED_ORIGINS", "http://localhost:8501"
 ).split(",")
@@ -75,27 +75,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Proje kök dizini: src/app/main.py → ../../ (proje kökü)
+# Proje kok dizini: src/app/main.py -> ../../ (proje koku)
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(_PROJECT_ROOT, "data", "raw"))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(_PROJECT_ROOT, "data", "processed"))
 INPUT_JSON = os.environ.get("INPUT_JSON", os.path.join(DATA_DIR, "logiai_mvp_input.json"))
 
-# ──────────────────────────────────────────────
-#  FIX #9 & #36 — load_input uygulama-seviye lru_cache
-# ──────────────────────────────────────────────
+# FIX #34 - TM kapasite/asim/ceza heuristikleri kaldirildi.
+# Sartname (MVP/Dataset A): "Transfer merkezi kisiti yoktur" ve "sinirsiz
+# alaniniz oldugunu varsayabilirsiniz." Optimizasyon motoru TM kapasitesini
+# kullanmiyor; bu yuzden /api/tm-status artik yalnizca gercek daily_demand'den
+# turetilen sehir bazli talep yogunlugunu (giren/cikan desi) doner.
 
-@lru_cache(maxsize=1)
-def load_input(path: str) -> dict:
-    """JSON'u bir kez diskten okur; sonraki çağrılarda cache'ten döner."""
+# --------------------------------------------------
+#  FIX #9 & #39 - load_input mtime-duyarli cache
+# --------------------------------------------------
+# FIX #39 - Dosya mtime'i cache anahtarinin parcasidir; data/raw volume mount
+# edildiginden JSON guncellenince mtime degisir, yeni anahtar = cache miss =
+# otomatik yeniden okuma. API restart gerekmez. Ayni mtime anahtari tum tureyen
+# cache'lerde (_build_demand_index, _load_city_coords, _fleet_skeleton, _tm_density)
+# kullanildigindan girdi degisince hepsi birlikte tazelenir (FIX #41 ile uyumlu).
+
+def _path_mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _input_mtime() -> float:
+    """INPUT_JSON'un guncel mtime'i - tureyen cache'lerin tazeleme anahtari."""
+    return _path_mtime(INPUT_JSON)
+
+
+@lru_cache(maxsize=2)
+def _load_input_cached(path: str, mtime: float) -> dict:
     return _load_input_raw(path)
 
 
-# ──────────────────────────────────────────────
-#  FIX #24 — NaN / Infinity sanitizasyon
-# ──────────────────────────────────────────────
+def load_input(path: str) -> dict:
+    """JSON'u diskten okur; dosya degismedikce cache'ten doner (mtime anahtarli)."""
+    return _load_input_cached(path, _path_mtime(path))
+
+
+# --------------------------------------------------
+#  FIX #24 - NaN / Infinity sanitizasyon
+# --------------------------------------------------
 
 def _sanitize(obj):
-    """JSON standardını ihlal eden float değerleri (NaN, Inf) None'a çevirir."""
+    """JSON standardini ihlal eden float degerleri (NaN, Inf) None'a cevirir."""
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
             return None
@@ -107,24 +134,24 @@ def _sanitize(obj):
     return obj
 
 
-# ──────────────────────────────────────────────
-#  Modeller (Pydantic) — FIX #42 strict=True
-# ──────────────────────────────────────────────
+# --------------------------------------------------
+#  Modeller (Pydantic) - FIX #42 strict=True
+# --------------------------------------------------
 
 class OptimizeRequest(BaseModel):
     model_config = ConfigDict(strict=True)  # FIX #42
 
     tarih: str = Field(..., description="Planlama tarihi (YYYY-MM-DD)")
-    time_limit: int = Field(540, ge=1, description="OR-Tools zaman sınırı (saniye)")
+    time_limit: int = Field(540, ge=1, description="OR-Tools zaman siniri (saniye)")
 
-    # FIX #20 — tarih formatı doğrulaması
+    # FIX #20 - tarih formati dogrulamasi
     @field_validator("tarih")
     @classmethod
     def validate_tarih(cls, v: str) -> str:
         try:
             datetime.date.fromisoformat(v)
         except ValueError:
-            raise ValueError("tarih YYYY-MM-DD formatında olmalı (örn: 2026-01-15)")
+            raise ValueError("tarih YYYY-MM-DD formatinda olmali (orn: 2026-01-15)")
         return v
 
 
@@ -170,15 +197,15 @@ class OptimizeResponse(BaseModel):
     calisma_suresi_sn: float
 
 
-class TMDurum(BaseModel):
+# FIX #34 - Sahte kapasite/asim/ceza yerine gercek talep yogunlugu modeli
+class SehirTalepYogunlugu(BaseModel):
     model_config = ConfigDict(strict=False)
 
-    tm_id: str
-    tm_ad: str
-    kapasite: int
-    yuk: int
-    asim: int
-    asim_maliyet: float
+    sehir_id: str
+    sehir_ad: str
+    giren_desi: int   # sehre gelen toplam desi (varis)
+    cikan_desi: int   # sehirden cikan toplam desi (kaynak)
+    toplam_desi: int  # giren + cikan
 
 
 class FleetVehicle(BaseModel):
@@ -192,37 +219,40 @@ class FleetVehicle(BaseModel):
     doluluk_pct: float = 0.0
 
 
-# ──────────────────────────────────────────────
-#  Yardımcı Fonksiyonlar
-# ──────────────────────────────────────────────
+# --------------------------------------------------
+#  Yardimci Fonksiyonlar
+# --------------------------------------------------
 
-# FIX #4 — _COORDS_XLSX bağımlılığı kaldırıldı
-# Koordinatlar artık logiai_mvp_input.json["city_coords"] anahtarından okunur.
-# Format: {"İstanbul": {"lat": 41.01, "lon": 28.97}, ...}
+# FIX #4 - _COORDS_XLSX bagimliligi kaldirildi
+# Koordinatlar artik logiai_mvp_input.json["city_coords"] anahtarindan okunur.
+# Format: {"Istanbul": {"lat": 41.01, "lon": 28.97}, ...}
 
-@lru_cache(maxsize=1)
-def _load_city_coords() -> dict[str, dict]:
-    """
-    city_coords'u logiai_mvp_input.json'dan okur.
-    JSON'da "city_coords" anahtarı yoksa boş dict döner (koordinatsız şehirler
-    haritada varsayılan konuma yerleşir).
-    """
+@lru_cache(maxsize=2)
+def _load_city_coords_cached(mtime: float) -> dict[str, dict]:
     try:
         data = load_input(INPUT_JSON)
         return data.get("city_coords", {})
     except Exception as exc:
-        logger.warning("Koordinat verisi okunamadı: %s", exc)
+        logger.warning("Koordinat verisi okunamadi: %s", exc)
         return {}
 
 
-# FIX #1 — int(float(desi)) → float round(2)
-# FIX #21 — dict index: tarih → list[row] ile O(1) erişim
-
-@lru_cache(maxsize=1)
-def _build_demand_index() -> dict[str, list[dict]]:
+def _load_city_coords() -> dict[str, dict]:
     """
-    daily_demand'ı {tarih: [row, ...]} formatında indeksler.
-    Disk I/O bir kez yapılır (lru_cache), filtreler O(1) dict lookup.
+    city_coords'u logiai_mvp_input.json'dan okur (FIX #39 - mtime anahtarli).
+    JSON'da "city_coords" anahtari yoksa bos dict doner.
+    """
+    return _load_city_coords_cached(_input_mtime())
+
+
+# FIX #1 - int(float(desi)) -> float round(2)
+# FIX #21 - dict index: tarih -> list[row] ile O(1) erisim
+
+@lru_cache(maxsize=2)
+def _build_demand_index_cached(mtime: float) -> dict[str, list[dict]]:
+    """
+    daily_demand'i {tarih: [row, ...]} formatinda indeksler.
+    FIX #39 - mtime anahtarli; girdi degisince yeniden kurulur.
     """
     data = load_input(INPUT_JSON)
     daily_demand = data.get("daily_demand", {})
@@ -238,15 +268,20 @@ def _build_demand_index() -> dict[str, list[dict]]:
                         "tarih": tarih,
                         "gonderen_id": origin,
                         "alan_id": dest,
-                        "talep_desi": str(val),  # FIX #1 — ondalık korundu
+                        "talep_desi": str(val),  # FIX #1 - ondalik korundu
                         "gun": str(day_idx),
                     })
         index[tarih] = rows
     return index
 
 
+def _build_demand_index() -> dict[str, list[dict]]:
+    """FIX #39 - mtime anahtarli demand index (girdi degisince tazelenir)."""
+    return _build_demand_index_cached(_input_mtime())
+
+
 def load_demand() -> list[dict]:
-    """Tüm talep satırlarını düz liste olarak döner."""
+    """Tum talep satirlarini duz liste olarak doner."""
     idx = _build_demand_index()
     result = []
     for rows in idx.values():
@@ -255,12 +290,12 @@ def load_demand() -> list[dict]:
 
 
 def load_distance_matrix() -> dict:
-    """logiai_mvp_input.json'dan mesafe matrisini döner."""
+    """logiai_mvp_input.json'dan mesafe matrisini doner."""
     return load_input(INPUT_JSON).get("distance_matrix", {})
 
 
 def load_travel_time_matrix() -> dict:
-    """Seyahat süresi matrisini mesafeden türetir (ort. 80 km/saat)."""
+    """Seyahat suresi matrisini mesafeden turetir (ort. 80 km/saat)."""
     dist = load_distance_matrix()
     return {
         origin: {dest: round(km / 80.0, 2) for dest, km in dests.items()}
@@ -269,25 +304,25 @@ def load_travel_time_matrix() -> dict:
 
 
 def get_demand_for_date(date_str: str) -> list[dict]:
-    """FIX #21 — O(1) dict lookup, O(N) tarama yok."""
+    """FIX #21 - O(1) dict lookup, O(N) tarama yok."""
     return _build_demand_index().get(date_str, [])
 
 
 def _run_pipeline(data: dict, date: str, time_limit_sec: int = 540) -> dict:
     """
-    İki aşamalı optimizasyon boru hattını çalıştırır ve JSON-uyumlu dict döner.
+    Iki asamali optimizasyon boru hattini calistirir ve JSON-uyumlu dict doner.
 
-    Aşama 1 → Greedy kiralık atama   (optimization.greedy)
-    Aşama 2 → OR-Tools Open VRP      (optimization.vrp_solver)
+    Asama 1 -> Greedy kiralik atama   (optimization.greedy)
+    Asama 2 -> OR-Tools Open VRP      (optimization.vrp_solver)
     """
     res = run_pipeline(data, date, time_limit_sec=time_limit_sec)
     raw = result_to_dict(res)
     return _sanitize(raw)  # FIX #24
 
 
-# ──────────────────────────────────────────────
+# --------------------------------------------------
 #  Endpoints
-# ──────────────────────────────────────────────
+# --------------------------------------------------
 
 @app.get("/")
 def root():
@@ -307,33 +342,33 @@ def health():
     }
 
 
-# FIX #3 — Senkron endpoint deprecated; async kullanımı öneriliyor
+# FIX #3 - Senkron endpoint deprecated; async kullanimi oneriliyor
 @app.post("/api/optimize", response_model=OptimizeResponse, deprecated=True)
 def optimize(req: OptimizeRequest):
     """
-    ⚠️ DEPRECATED — Bu endpoint 9 dakikaya kadar bloke olabilir.
-    Lütfen /api/optimize/async endpoint'ini kullanın.
+    DEPRECATED - Bu endpoint 9 dakikaya kadar bloke olabilir.
+    Lutfen /api/optimize/async endpoint'ini kullanin.
 
-    İki Aşamalı Optimizasyon Motoru (Ön Rapor Uyumlu)
+    Iki Asamali Optimizasyon Motoru (On Rapor Uyumlu)
 
-    Aşama 1 — Greedy Kiralık Filo Atama
-    Aşama 2 — OR-Tools Spot VRP
+    Asama 1 - Greedy Kiralik Filo Atama
+    Asama 2 - OR-Tools Spot VRP
     """
     start = datetime.datetime.now(datetime.timezone.utc)  # FIX #31
 
     if not os.path.exists(INPUT_JSON):
-        raise HTTPException(404, f"Girdi dosyası bulunamadı: {INPUT_JSON}")
+        raise HTTPException(404, f"Girdi dosyasi bulunamadi: {INPUT_JSON}")
 
     try:
         data = load_input(INPUT_JSON)
     except DataContractError as e:
-        raise HTTPException(400, f"Veri sözleşmesi hatası: {e}")
+        raise HTTPException(400, f"Veri sozlesmesi hatasi: {e}")
 
     dates = available_dates(data)
     if req.tarih not in dates:
         raise HTTPException(
             404,
-            f"{req.tarih} tarihi için talep verisi bulunamadı. "
+            f"{req.tarih} tarihi icin talep verisi bulunamadi. "
             f"Mevcut tarihler: {dates}"
         )
 
@@ -348,12 +383,12 @@ def optimize(req: OptimizeRequest):
 @app.get("/api/predict")
 def predict(
     tarih: str = Query(..., description="Tahmin tarihi (YYYY-MM-DD)"),
-    sehir: Optional[str] = Query(None, description="Şehir filtresi"),
+    sehir: Optional[str] = Query(None, description="Sehir filtresi"),
 ):
     """
     LSTM Talep Tahmini (Placeholder)
-    Gelişmiş aşamada gerçek LSTM modeli entegre edilecek.
-    Şimdilik historical data üzerinden basit istatistiksel tahmin.
+    Gelismis asamada gercek LSTM modeli entegre edilecek.
+    Simdilik historical data uzerinden basit istatistiksel tahmin.
     """
     demand_data = load_demand()
 
@@ -375,17 +410,37 @@ def predict(
             "p10": round(max(0, avg - 1.28 * std), 0),
             "p90": round(avg + 1.28 * std, 0),
             "model": "statistical_baseline",
-            "not": "LSTM modeli gelişmiş aşamada entegre edilecektir",
+            "not": "LSTM modeli gelismis asamada entegre edilecektir",
         })
 
     return {"tarih": tarih, "tahminler": predictions}
 
 
+# FIX #41 - Statik filo iskeleti (rental_routes + cost_matrix taramasi) mtime
+# anahtariyla cache'lenir; her istekte yeniden taranmaz. Tarihe/job'a bagli
+# doluluk_pct ise runtime'da uzerine bindirilir (job verisi cache'lenmez).
+@lru_cache(maxsize=2)
+def _fleet_skeleton(mtime: float) -> tuple[dict, ...]:
+    data = load_input(INPUT_JSON)
+    rows = []
+    for route_key, vehicles in data.get("rental_routes", {}).items():
+        origin, dest = route_key.split("_", 1)
+        for v in vehicles:
+            vtype = v.get("vehicle_type", "Tir")
+            cost_row = data.get("cost_matrix", {}).get(origin, {}).get(dest, {}).get(vtype, {})
+            sabit = float(cost_row.get("kiralik", cost_row.get("kiralik", 0)))
+            rows.append({
+                "arac_id": v["id"],
+                "tip": vtype,
+                "sabit_gunluk": sabit,
+                "rota": f"{origin}->{dest}",
+            })
+    return tuple(rows)
+
+
 @app.get("/api/fleet", response_model=list[FleetVehicle])
 def fleet_status(tarih: Optional[str] = Query(None)):
-    """Kiralık filo durum raporu."""
-    data = load_input(INPUT_JSON)
-
+    """Kiralik filo durum raporu. FIX #41 - iskelet cache'li, doluluk runtime."""
     utilisation_map: dict[str, float] = {}
     if tarih:
         job = _get_job_for_date(tarih)
@@ -397,126 +452,151 @@ def fleet_status(tarih: Optional[str] = Query(None)):
                 )
 
     result = []
-    for route_key, vehicles in data.get("rental_routes", {}).items():
-        origin, dest = route_key.split("_", 1)
-        for v in vehicles:
-            vid = v["id"]
-            vtype = v.get("vehicle_type", "Tır")
-            cost_row = data.get("cost_matrix", {}).get(origin, {}).get(dest, {}).get(vtype, {})
-            sabit = float(cost_row.get("kiralik", cost_row.get("kiralık", 0)))
-            result.append(FleetVehicle(
-                arac_id=vid,
-                tip=vtype,
-                sabit_gunluk=sabit,
-                aktif=True,
-                rota=f"{origin}→{dest}",
-                doluluk_pct=round(utilisation_map.get(vid, 0.0) * 100, 1),
-            ))
-    return result
-
-
-@app.get("/api/tm-status", response_model=list[TMDurum])
-def tm_status(tarih: Optional[str] = Query(None)):
-    """Transfer merkezi kapasite izleme — logiai_mvp_input.json'dan türetilir."""
-    data = load_input(INPUT_JSON)
-    daily_demand = data.get("daily_demand", {})
-
-    # FIX #31 — UTC-aware datetime
-    target_date = tarih or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-
-    city_max_flow: dict[str, float] = {}
-    for date, origins in daily_demand.items():
-        day_flow: dict[str, float] = {}
-        for origin, dests in origins.items():
-            for dest, desi in dests.items():
-                day_flow[origin] = day_flow.get(origin, 0.0) + float(desi)
-                day_flow[dest]   = day_flow.get(dest,   0.0) + float(desi)
-        for city, flow in day_flow.items():
-            if flow > city_max_flow.get(city, 0.0):
-                city_max_flow[city] = flow
-
-    date_flow: dict[str, float] = {}
-    for origin, dests in daily_demand.get(target_date, {}).items():
-        for dest, desi in dests.items():
-            date_flow[origin] = date_flow.get(origin, 0.0) + float(desi)
-            date_flow[dest]   = date_flow.get(dest,   0.0) + float(desi)
-
-    result = []
-    for city in sorted(city_max_flow.keys()):
-        kapasite = int(city_max_flow[city] * 1.5)
-        yuk      = int(date_flow.get(city, 0.0))
-        asim     = max(0, yuk - kapasite)
-        result.append(TMDurum(
-            tm_id=city[:4].upper()
-                .replace("İ", "I").replace("Ş", "S").replace("Ç", "C")
-                .replace("Ğ", "G").replace("Ü", "U").replace("Ö", "O"),
-            tm_ad=city,
-            kapasite=kapasite,
-            yuk=yuk,
-            asim=asim,
-            asim_maliyet=round(asim * 8.0, 2),
+    for row in _fleet_skeleton(_input_mtime()):
+        vid = row["arac_id"]
+        result.append(FleetVehicle(
+            arac_id=vid,
+            tip=row["tip"],
+            sabit_gunluk=row["sabit_gunluk"],
+            aktif=True,
+            rota=row["rota"],
+            doluluk_pct=round(utilisation_map.get(vid, 0.0) * 100, 1),
         ))
     return result
 
 
+# FIX #41 - Sonuc (mtime, tarih) anahtariyla cache'lenir; her istekte yeniden
+# hesaplanmaz, girdi degisince otomatik tazelenir.
+@lru_cache(maxsize=256)
+def _tm_density(mtime: float, target_date: str) -> list[SehirTalepYogunlugu]:
+    data = load_input(INPUT_JSON)
+    daily_demand = data.get("daily_demand", {})
+
+    giren: dict[str, float] = {}
+    cikan: dict[str, float] = {}
+    for origin, dests in daily_demand.get(target_date, {}).items():
+        for dest, desi in dests.items():
+            cikan[origin] = cikan.get(origin, 0.0) + float(desi)
+            giren[dest]   = giren.get(dest,   0.0) + float(desi)
+
+    result = []
+    for city in sorted(set(giren) | set(cikan)):
+        g = int(giren.get(city, 0.0))
+        c = int(cikan.get(city, 0.0))
+        result.append(SehirTalepYogunlugu(
+            sehir_id=city[:4].upper(),
+            sehir_ad=city,
+            giren_desi=g,
+            cikan_desi=c,
+            toplam_desi=g + c,
+        ))
+    return result
+
+
+@app.get("/api/tm-status", response_model=list[SehirTalepYogunlugu])
+def tm_status(tarih: Optional[str] = Query(None)):
+    """
+    FIX #34 - Sehir bazli talep yogunlugu (gercek daily_demand'den).
+    MVP/Dataset A'da TM kapasite kisiti yoktur (sartname); bu yuzden uydurma
+    kapasite/asim/ceza yerine secili tarih icin sehre giren (varis) ve
+    sehirden cikan (kaynak) gercek desi gosterilir.
+    FIX #41 - Sonuc cache'lenir.
+    """
+    # FIX #31 - UTC-aware datetime
+    target_date = tarih or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    return _tm_density(_input_mtime(), target_date)
+
+
 @app.get("/api/excel")
-def generate_excel(tarih: str = Query(...)):
-    """Optimizasyon sonuçlarını Excel olarak oluştur"""
+def generate_excel(
+    tarih: str = Query(...),
+    time_limit: int = Query(120, ge=1, description="Tamamlanmis job yoksa sync optimizasyon zaman siniri (sn)"),
+):
+    """
+    FIX #35 - Excel ciktisi optimizasyon SONUCUNDAN uretilir (kiralik + spot
+    atamalar). Ana sayfa kolonlari jurinin example_solution.xlsx formatiyla
+    ayni: Tarih, Arac Tipi, Cikis TM, Varis TM, Atanan Desi, Maliyet.
+
+    Veri kaynagi: once o tarih icin tamamlanmis async job sonucu kullanilir;
+    yoksa boru hatti senkron calistirilir (fallback her kosulda gecerli plan
+    garanti eder).
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     from fastapi.responses import FileResponse
 
-    date_demands = get_demand_for_date(tarih)  # FIX #21 — O(1)
+    date_demands = get_demand_for_date(tarih)  # FIX #21 - O(1)
 
     if not date_demands:
-        raise HTTPException(404, f"{tarih} için veri yok")
+        raise HTTPException(404, f"{tarih} icin veri yok")
+
+    mvp_data = load_input(INPUT_JSON)
+
+    # FIX #35 - Optimizasyon sonucunu al: once tamamlanmis job, yoksa sync calistir
+    result = None
+    job = _get_job_for_date(tarih)
+    if job and job.get("status") == "COMPLETED":
+        result = job.get("result")
+    if result is None:
+        result = _run_pipeline(mvp_data, tarih, time_limit_sec=time_limit)
+
+    rental_assignments = result.get("rental_assignments", [])
+    spot_assignments   = result.get("spot_assignments", [])
+
+    # FIX #35 - rental atamalarinda vehicle_type yok; rental_routes'tan id->tip eslemesi
+    id_to_vtype: dict[str, str] = {}
+    for vehicles in mvp_data.get("rental_routes", {}).values():
+        for v in vehicles:
+            id_to_vtype[v["id"]] = v.get("vehicle_type", "Tir")
 
     wb = Workbook()
 
-    # ── Sayfa 1: Rota Planı ──
+    # -- Sayfa 1: Cozum (juri formati) --
     ws1 = wb.active
-    ws1.title = "Rota Planı"
+    ws1.title = "Cozum"
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
 
-    headers1 = ["Araç ID", "Tip", "Rota", "Kaynak", "Hedef", "Yük (desi)", "Mesafe (km)", "Süre (saat)", "Maliyet (₺)"]
+    # FIX #35 - example_solution.xlsx kolon yapisi
+    headers1 = ["Tarih", "Arac Tipi", "Cikis TM", "Varis TM", "Atanan Desi", "Maliyet"]
     for col, h in enumerate(headers1, 1):
         cell = ws1.cell(row=1, column=col, value=h)
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
 
-    mvp_data    = load_input(INPUT_JSON)
-    dist_matrix = load_distance_matrix()
-    time_matrix = load_travel_time_matrix()
     row_idx = 2
-    total_fixed = 0
-    for route_key, vehicles in mvp_data.get("rental_routes", {}).items():
-        src, dst = route_key.split("_", 1)
-        demand_val = next(
-            (int(float(r["talep_desi"])) for r in date_demands
-             if r["gonderen_id"] == src and r["alan_id"] == dst), 0
-        )
-        for v in vehicles:
-            vtype = v.get("vehicle_type", "Tır")
-            cap   = float(v.get("capacity_desi", 0))
-            cost_row = mvp_data.get("cost_matrix", {}).get(src, {}).get(dst, {}).get(vtype, {})
-            sabit = float(cost_row.get("kiralik", cost_row.get("kiralık", 0)))
-            total_fixed += sabit
-            ws1.cell(row=row_idx, column=1, value=v["id"])
-            ws1.cell(row=row_idx, column=2, value="Kiralık " + vtype)
-            ws1.cell(row=row_idx, column=3, value=f"{src}-{dst}")
-            ws1.cell(row=row_idx, column=4, value=src)
-            ws1.cell(row=row_idx, column=5, value=dst)
-            ws1.cell(row=row_idx, column=6, value=min(demand_val, cap))
-            ws1.cell(row=row_idx, column=7, value=dist_matrix.get(src, {}).get(dst, 0))
-            ws1.cell(row=row_idx, column=8, value=time_matrix.get(src, {}).get(dst, 0))
-            ws1.cell(row=row_idx, column=9, value=sabit)
-            row_idx += 1
+    total_rental = 0.0
+    total_spot   = 0.0
 
-    # ── Sayfa 2: Talep Özeti ──
-    ws2 = wb.create_sheet("Talep Özeti")
-    headers2 = ["Tarih", "Gönderen", "Alan", "Talep (desi)"]
+    # Kiralik atamalar
+    for a in rental_assignments:
+        vtype = id_to_vtype.get(a.get("vehicle_id", ""), "Tir")
+        cost  = float(a.get("cost", 0.0))
+        total_rental += cost
+        ws1.cell(row=row_idx, column=1, value=tarih)
+        ws1.cell(row=row_idx, column=2, value=f"Kiralik {vtype}")
+        ws1.cell(row=row_idx, column=3, value=a.get("origin"))
+        ws1.cell(row=row_idx, column=4, value=a.get("destination"))
+        ws1.cell(row=row_idx, column=5, value=round(float(a.get("assigned_desi", 0.0)), 2))
+        ws1.cell(row=row_idx, column=6, value=round(cost, 2))
+        row_idx += 1
+
+    # Spot atamalar (FIX #35 - onceki surumde tamamen eksikti)
+    for a in spot_assignments:
+        cost = float(a.get("cost", 0.0))
+        total_spot += cost
+        ws1.cell(row=row_idx, column=1, value=tarih)
+        ws1.cell(row=row_idx, column=2, value=f"Spot {a.get('vehicle_type', '')}")
+        ws1.cell(row=row_idx, column=3, value=a.get("origin"))
+        ws1.cell(row=row_idx, column=4, value=a.get("destination"))
+        ws1.cell(row=row_idx, column=5, value=round(float(a.get("assigned_desi", 0.0)), 2))
+        ws1.cell(row=row_idx, column=6, value=round(cost, 2))
+        row_idx += 1
+
+    # -- Sayfa 2: Talep Ozeti --
+    ws2 = wb.create_sheet("Talep Ozeti")
+    headers2 = ["Tarih", "Gonderen", "Alan", "Talep (desi)"]
     for col, h in enumerate(headers2, 1):
         cell = ws2.cell(row=1, column=col, value=h)
         cell.font = header_font
@@ -528,20 +608,20 @@ def generate_excel(tarih: str = Query(...)):
         ws2.cell(row=i, column=3, value=r["alan_id"])
         ws2.cell(row=i, column=4, value=float(r["talep_desi"]))  # FIX #1
 
-    # ── Sayfa 3: Maliyet Analizi ──
+    # -- Sayfa 3: Maliyet Analizi (FIX #35 - gercek spot maliyeti) --
     ws3 = wb.create_sheet("Maliyet Analizi")
-    headers3 = ["Kalem", "Tutar (₺)"]
+    headers3 = ["Kalem", "Tutar (TL)"]
     for col, h in enumerate(headers3, 1):
         cell = ws3.cell(row=1, column=col, value=h)
         cell.font = header_font
         cell.fill = header_fill
 
-    ws3.cell(row=2, column=1, value="Kiralık Filo Sabit")
-    ws3.cell(row=2, column=2, value=total_fixed)
-    ws3.cell(row=3, column=1, value="Spot Araç Değişken")
-    ws3.cell(row=3, column=2, value="— (optimizasyon sonrası)")
+    ws3.cell(row=2, column=1, value="Kiralik Filo Sabit")
+    ws3.cell(row=2, column=2, value=round(total_rental, 2))
+    ws3.cell(row=3, column=1, value="Spot Arac Degisken")
+    ws3.cell(row=3, column=2, value=round(total_spot, 2))
     ws3.cell(row=4, column=1, value="TOPLAM")
-    ws3.cell(row=4, column=2, value=total_fixed)
+    ws3.cell(row=4, column=2, value=round(total_rental + total_spot, 2))
     ws3.cell(row=4, column=1).font = Font(bold=True)
 
     output_path = os.path.join(OUTPUT_DIR, f"rapor_{tarih}.xlsx")
@@ -557,36 +637,48 @@ def generate_excel(tarih: str = Query(...)):
 
 @app.get("/api/cities")
 def list_cities():
-    """Tüm şehir ve TM bilgisi — koordinatlar logiai_mvp_input.json'dan okunur."""
-    # FIX #4 — Excel bağımlılığı kaldırıldı
+    """
+    Sehir listesi ve koordinatlari (logiai_mvp_input.json'dan).
+    FIX #34 - Uydurma tm_var/tm_kapasite/tir_yanasma sabitleri kaldirildi;
+    MVP'de TM kapasite kisiti yoktur, bu alanlar veriye dayanmiyordu.
+    """
+    # FIX #4 - Excel bagimliligi kaldirildi
     data = load_input(INPUT_JSON)
     coords_map = _load_city_coords()
     cities = []
     for city_name in sorted(data["distance_matrix"].keys()):
         coords = coords_map.get(city_name, {"lat": 39.0, "lon": 35.0})
         cities.append({
-            "id":          city_name,
-            "ad":          city_name,
-            "lat":         coords["lat"],
-            "lon":         coords["lon"],
-            "tm_var":      True,
-            "tm_kapasite": 500000,
-            "tir_yanasma": True,
+            "id":   city_name,
+            "ad":   city_name,
+            "lat":  coords["lat"],
+            "lon":  coords["lon"],
         })
     return {"sehirler": cities}
+
+
+@app.get("/api/dates")
+def list_dates():
+    """
+    Talep verisinde mevcut planlama tarihleri (sirali).
+    Dashboard tarih secici bu listeden beslenir; boylece veride olmayan
+    bir tarih secilip 404 alinmasi engellenir.
+    """
+    data = load_input(INPUT_JSON)
+    return {"tarihler": sorted(available_dates(data))}
 
 
 @app.get("/api/vehicles")
 def list_vehicles():
     """
-    FIX #2 — Araç tipi bilgileri artık logiai_mvp_input.json'dan türetiliyor.
-    JSON'da 'vehicle_types' anahtarı yoksa statik fallback kullanılır.
+    FIX #2 - Arac tipi bilgileri artik logiai_mvp_input.json'dan turetiliyor.
+    JSON'da 'vehicle_types' anahtari yoksa statik fallback kullanilir.
     """
     data = load_input(INPUT_JSON)
     if "vehicle_types" in data:
         return {"arac_tipleri": data["vehicle_types"]}
 
-    # Fallback: cost_matrix'ten benzersiz araç tiplerini topla
+    # Fallback: cost_matrix'ten benzersiz arac tiplerini topla
     cost_matrix = data.get("cost_matrix", {})
     seen: set[str] = set()
     for origin_data in cost_matrix.values():
@@ -595,7 +687,7 @@ def list_vehicles():
 
     # Statik kapasite tablosu (JSON'dan okunamazsa)
     _static_caps = {
-        "Tır": {"id": "TIR", "ad": "Tır", "kapasite_desi": 22400, "sabit_maliyet": 7000.0, "km_basi_maliyet": 13.0, "tir_yanasma_gerekli": True},
+        "Tir": {"id": "TIR", "ad": "Tir", "kapasite_desi": 22400, "sabit_maliyet": 7000.0, "km_basi_maliyet": 13.0, "tir_yanasma_gerekli": True},
         "Kamyon": {"id": "KAM", "ad": "Kamyon", "kapasite_desi": 12000, "sabit_maliyet": 5000.0, "km_basi_maliyet": 10.0, "tir_yanasma_gerekli": False},
         "Hafif Kamyon": {"id": "HAF", "ad": "Hafif Kamyon", "kapasite_desi": 7200, "sabit_maliyet": 5000.0, "km_basi_maliyet": 10.0, "tir_yanasma_gerekli": False},
         "Kamyonet": {"id": "KMT", "ad": "Kamyonet", "kapasite_desi": 5600, "sabit_maliyet": 3750.0, "km_basi_maliyet": 6.0, "tir_yanasma_gerekli": False},
@@ -607,16 +699,16 @@ def list_vehicles():
     return {"arac_tipleri": arac_tipleri}
 
 
-# FIX #33 — pagination eklendi
+# FIX #33 - pagination eklendi
 @app.get("/api/demand")
 def get_demand(
     tarih: Optional[str] = Query(None),
     sehir: Optional[str] = Query(None),
-    limit: int = Query(500, ge=1, le=5000, description="Sayfa başı kayıt"),
-    offset: int = Query(0, ge=0, description="Başlangıç offset"),
+    limit: int = Query(500, ge=1, le=5000, description="Sayfa basi kayit"),
+    offset: int = Query(0, ge=0, description="Baslangic offset"),
 ):
-    """Talep verisi sorgulama — sayfalı (limit/offset)"""
-    # FIX #21 — index'li erişim
+    """Talep verisi sorgulama - sayfali (limit/offset)"""
+    # FIX #21 - index'li erisim
     if tarih:
         demand_data = list(_build_demand_index().get(tarih, []))
     else:
@@ -630,9 +722,9 @@ def get_demand(
     return {"toplam_kayit": total, "limit": limit, "offset": offset, "talepler": page}
 
 
-# ──────────────────────────────────────────────
-#  Async Optimizasyon — Redis Polling
-# ──────────────────────────────────────────────
+# --------------------------------------------------
+#  Async Optimizasyon - Redis Polling
+# --------------------------------------------------
 
 class AsyncJobResponse(BaseModel):
     model_config = ConfigDict(strict=False)
@@ -641,48 +733,48 @@ class AsyncJobResponse(BaseModel):
     status: str
 
 
-# FIX #44 — BackgroundTasks ile worker
-# FIX #10 — Semaphore: maksimum eş zamanlı iş sınırı
+# FIX #44 - BackgroundTasks ile worker
+# FIX #10 - Semaphore: maksimum eszamanli is siniri
 @app.post("/api/optimize/async", response_model=AsyncJobResponse)
 def optimize_async(req: OptimizeRequest, background_tasks: BackgroundTasks):
     """
-    Optimizasyonu arka planda başlatır; arayüz kilitlenmez.
+    Optimizasyonu arka planda baslatir; arayuz kilitlenmez.
 
-    Hemen job_id döner. İstemci /api/jobs/{job_id} adresini
+    Hemen job_id doner. Istemci /api/jobs/{job_id} adresini
     periyodik olarak sorgulayarak durumu takip eder.
 
-    İş durumları: PENDING → RUNNING → COMPLETED | FAILED
+    Is durumlari: PENDING -> RUNNING -> COMPLETED | FAILED
 
-    FIX #39 — NOT: uvicorn --workers > 1 ile çalıştırıldığında her worker
-    kendi izole ThreadPool havuzuna sahiptir. Gerçek multi-worker ortamı için
-    Celery veya ARQ kullanılması önerilir.
+    FIX #39 - NOT: uvicorn --workers > 1 ile calistirildiginda her worker
+    kendi izole havuzuna sahiptir. Gercek multi-worker ortami icin
+    Celery veya ARQ kullanilmasi onerilir.
     """
     if not os.path.exists(INPUT_JSON):
-        raise HTTPException(404, f"Girdi dosyası bulunamadı: {INPUT_JSON}")
+        raise HTTPException(404, f"Girdi dosyasi bulunamadi: {INPUT_JSON}")
 
     try:
         data = load_input(INPUT_JSON)
     except DataContractError as e:
-        raise HTTPException(400, f"Veri sözleşmesi hatası: {e}")
+        raise HTTPException(400, f"Veri sozlesmesi hatasi: {e}")
 
     dates = available_dates(data)
     if req.tarih not in dates:
         raise HTTPException(
             404,
-            f"{req.tarih} tarihi için talep verisi bulunamadı. "
+            f"{req.tarih} tarihi icin talep verisi bulunamadi. "
             f"Mevcut tarihler: {dates}",
         )
 
-    # FIX #10 — Semaphore kapıda — doluysa 429
+    # FIX #10 - Semaphore kapida - doluysa 429
     if not _semaphore.acquire(blocking=False):
         raise HTTPException(
             status_code=429,
-            detail=f"Maksimum eş zamanlı iş sayısına ({_MAX_CONCURRENT_JOBS}) ulaşıldı. Lütfen bekleyin.",
+            detail=f"Maksimum eszamanli is sayisina ({_MAX_CONCURRENT_JOBS}) ulasildi. Lutfen bekleyin.",
         )
 
     job_id = create_job()
 
-    # FIX #44 — BackgroundTasks (FastAPI native)
+    # FIX #44 - BackgroundTasks (FastAPI native)
     def _worker():
         set_running(job_id)
         try:
@@ -692,12 +784,12 @@ def optimize_async(req: OptimizeRequest, background_tasks: BackgroundTasks):
             result["calisma_suresi_sn"] = round(elapsed, 3)
             set_completed(job_id, result)
         except Exception as exc:
-            logger.exception("Worker hatası job_id=%s", job_id)
-            # FIX #6 — set_failed try/except ile guard
+            logger.exception("Worker hatasi job_id=%s", job_id)
+            # FIX #6 - set_failed try/except ile guard
             try:
                 set_failed(job_id, str(exc))
             except Exception as inner_exc:
-                logger.error("set_failed başarısız job_id=%s: %s", job_id, inner_exc)
+                logger.error("set_failed basarisiz job_id=%s: %s", job_id, inner_exc)
         finally:
             _semaphore.release()
 
@@ -708,19 +800,19 @@ def optimize_async(req: OptimizeRequest, background_tasks: BackgroundTasks):
 @app.get("/api/jobs/{job_id}")
 def get_job_status(job_id: str):
     """
-    İş durumunu döner.
+    Is durumunu doner.
 
-    Dönen alan "status": PENDING | RUNNING | COMPLETED | FAILED
-    COMPLETED ise "result" alanı OptimizeResponse şemasıyla aynıdır.
-    FAILED ise "error" alanı hata mesajını içerir.
+    Donen alan "status": PENDING | RUNNING | COMPLETED | FAILED
+    COMPLETED ise "result" alani OptimizeResponse semasiyla aynidir.
+    FAILED ise "error" alani hata mesajini icerir.
     """
     job = _get_job(job_id)
     if job is None:
-        raise HTTPException(404, "Job bulunamadı veya süresi doldu (TTL: 1 saat).")
+        raise HTTPException(404, "Job bulunamadi veya suresi doldu (TTL: 1 saat).")
     return job
 
 
 if __name__ == "__main__":
     import uvicorn
-    # FIX #39 uyarısı: --workers > 1 için Celery/ARQ kullanın
+    # FIX #39 uyarisi: --workers > 1 icin Celery/ARQ kullanin
     uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
