@@ -1,26 +1,29 @@
 """
 utils/data_loader.py
 ====================
-JSON dosyasını okuyup veri sözleşmesine (data contract) uygunluğunu doğrular.
+Sonuç JSON dosyasını (logiai_mvp_input.json) okuyup veri sözleşmesine göre
+**temizler** (sanitize). Black-Box: yalnızca nihai JSON'u girdi alır; Kişi A'nın
+ham veri / Pandas koduna dokunmaz.
 
-SOLID — Single Responsibility:
-    Yalnızca I/O ve şema doğrulaması yapar.
-    İş mantığı veya optimizasyon kodu buraya girmez.
+Tasarım — Graceful Degradation (Kaptan Kuralı #2):
+    * Yalnızca JSON iskeletini bozan, motorun çalışmasını imkânsız kılan MAJÖR
+      eksikler için `DataContractError` fırlatılır (fail-fast):
+        - Dosya yok / geçersiz JSON
+        - Zorunlu üst düzey anahtar eksik
+        - Zorunlu üst düzey değer dict değil
+        - Temizlik sonrası hiç geçerli araç tipi / şehir / talep kalmaması
+    * Alt dallardaki bozuk kayıtlar (eşleşmeyen şehir, negatif değer, None fiyat,
+      bozuk tarih) ÇÖKERTMEZ — atlanır (skip), şeffaf bir uyarı (warning) basılır
+      ve sağlam veri işlenmeye devam eder.
 
-SOLID — Open/Closed:
-    Yeni şema alanları eklendiğinde _REQUIRED_TOP_KEYS listesi ve
-    _validate_schema() genişletilir; mevcut çağrı arayüzü değişmez.
-
-Kullanım:
-    from utils.data_loader import load_input
-
-    data = load_input("logiai_mvp_input.json")
+SOLID — Single Responsibility: yalnızca I/O + şema temizliği. İş mantığı girmez.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +33,8 @@ log = logging.getLogger(__name__)
 # Şema Sabitleri
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Motorun çalışması için ZORUNLU üst düzey anahtarlar (eksikse iskelet bozuk).
+# spot_capacities bilinçli olarak burada DEĞİL: yoksa vehicles_info'dan türetilir.
 _REQUIRED_TOP_KEYS: frozenset[str] = frozenset({
     "distance_matrix",
     "cost_matrix",
@@ -38,220 +43,214 @@ _REQUIRED_TOP_KEYS: frozenset[str] = frozenset({
     "vehicles_info",
 })
 
-_REQUIRED_COST_PRICE_TYPES: frozenset[str] = frozenset({"kiralik", "spot"})
+# Kiralık fiyat anahtarı her iki Türkçe yazımıyla da kabul edilir.
+_RENTAL_PRICE_KEYS: tuple[str, ...] = ("kiralik", "kiralık")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Özel İstisna
+# Özel İstisna — yalnızca İSKELET bozulduğunda fırlatılır
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DataContractError(ValueError):
     """
-    Yüklenen JSON veri sözleşmesini ihlal ettiğinde fırlatılır.
-
-    Mesaj, hangi alan/yolun hatalı olduğunu açıkça belirtir; bu sayede
-    hata ayıklama süresi minimize edilir.
+    JSON iskeleti motorun çalışmasını imkânsız kılacak biçimde bozuk olduğunda
+    fırlatılır. Alt dal bozuklukları bu hatayı tetiklemez; atlanır + uyarılır.
     """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Doğrulama Yardımcıları  (private)
+# İskelet Denetimi (hard-fail)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _validate_top_level(data: dict[str, Any]) -> None:
-    """Üst düzey zorunlu anahtarların varlığını denetler."""
+def _require_skeleton(data: dict[str, Any]) -> None:
+    """Üst düzey zorunlu anahtarların varlığını ve dict tipini denetler."""
+    if not isinstance(data, dict):
+        raise DataContractError("Kök JSON bir nesne (dict) olmalıdır.")
+
     missing = _REQUIRED_TOP_KEYS - data.keys()
     if missing:
-        raise DataContractError(
-            f"Eksik üst düzey alanlar: {sorted(missing)}"
-        )
+        raise DataContractError(f"Eksik üst düzey alanlar: {sorted(missing)}")
 
-
-def _validate_distance_matrix(dist_matrix: Any) -> None:
-    """
-    distance_matrix yapısını doğrular:
-        { origin: { dest: float } }
-
-    Tüm mesafe değerlerinin negatif olmayan sayı olduğunu kontrol eder.
-    """
-    if not isinstance(dist_matrix, dict):
-        raise DataContractError("distance_matrix bir dict olmalıdır.")
-
-    for origin, dests in dist_matrix.items():
-        if not isinstance(dests, dict):
+    for key in _REQUIRED_TOP_KEYS:
+        if not isinstance(data[key], dict):
             raise DataContractError(
-                f"distance_matrix['{origin}'] bir dict olmalıdır."
+                f"'{key}' bir dict olmalıdır (iskelet bozuk); alınan: {type(data[key]).__name__}"
             )
-        for dest, dist in dests.items():
-            if not isinstance(dist, (int, float)) or dist < 0:
-                raise DataContractError(
-                    f"distance_matrix['{origin}']['{dest}'] negatif olmayan sayı olmalıdır; "
-                    f"alınan: {dist!r}"
-                )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Sanitizer'lar (skip + warn) — her biri TEMİZLENMİŞ yapıyı döndürür
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _validate_rental_routes(rental_routes: Any) -> None:
-    """
-    rental_routes:
-        { "Şehir1_Şehir2": [{"id": str, "capacity_desi": number}, ...] }
-    """
-    if not isinstance(rental_routes, dict):
-        raise DataContractError("rental_routes bir dict olmalıdır.")
-
-    for route_key, vehicles in rental_routes.items():
-        if "_" not in route_key:
-            raise DataContractError(
-                f"rental_routes anahtarı 'Kaynak_Hedef' biçiminde olmalı; "
-                f"alınan: '{route_key}'"
-            )
-        if not isinstance(vehicles, list):
-            raise DataContractError(
-                f"rental_routes['{route_key}'] bir liste olmalıdır."
-            )
-        for idx, v in enumerate(vehicles):
-            for field in ("id", "capacity_desi"):
-                if field not in v:
-                    raise DataContractError(
-                        f"rental_routes['{route_key}'][{idx}] "
-                        f"'{field}' alanını içermiyor."
-                    )
-            cap = v["capacity_desi"]
-            if not isinstance(cap, (int, float)) or cap <= 0:
-                raise DataContractError(
-                    f"rental_routes['{route_key}'][{idx}]['capacity_desi'] "
-                    f"pozitif sayı olmalıdır; alınan: {cap!r}"
-                )
-
-
-def _validate_cost_matrix(cost_matrix: Any, vehicles_info: dict) -> None:
-    """
-    cost_matrix yapısını doğrular:
-        { origin: { dest: { vehicle_type: { "kiralik": n, "spot": n } } } }
-
-    Her (origin, dest, vehicle_type) kaydında hem "kiralik" hem "spot"
-    anahtarının bulunması ve değerlerinin negatif olmayan sayı olması beklenir.
-    """
-    if not isinstance(cost_matrix, dict):
-        raise DataContractError("cost_matrix bir dict olmalıdır.")
-
-    known_types = set(vehicles_info.keys())
-
-    for origin, destinations in cost_matrix.items():
-        if not isinstance(destinations, dict):
-            raise DataContractError(
-                f"cost_matrix['{origin}'] bir dict olmalıdır."
-            )
-        for dest, vehicle_costs in destinations.items():
-            if not isinstance(vehicle_costs, dict):
-                raise DataContractError(
-                    f"cost_matrix['{origin}']['{dest}'] bir dict olmalıdır."
-                )
-            for vtype, prices in vehicle_costs.items():
-                if vtype not in known_types:
-                    log.warning(
-                        "cost_matrix['%s']['%s']['%s'] vehicles_info'da "
-                        "tanımlı değil; atlanıyor.",
-                        origin, dest, vtype,
-                    )
-                    continue
-                if not isinstance(prices, dict):
-                    raise DataContractError(
-                        f"cost_matrix['{origin}']['{dest}']['{vtype}'] bir dict olmalıdır."
-                    )
-                missing_price_keys = _REQUIRED_COST_PRICE_TYPES - prices.keys()
-                if missing_price_keys:
-                    raise DataContractError(
-                        f"cost_matrix['{origin}']['{dest}']['{vtype}'] "
-                        f"eksik fiyat anahtarları: {sorted(missing_price_keys)}"
-                    )
-                for price_key in _REQUIRED_COST_PRICE_TYPES:
-                    val = prices.get(price_key)
-                    if val is not None and (not isinstance(val, (int, float)) or val < 0):
-                        raise DataContractError(
-                            f"cost_matrix['{origin}']['{dest}']['{vtype}']['{price_key}'] "
-                            f"negatif olmayan sayı olmalıdır; alınan: {val!r}"
-                        )
-
-
-def _validate_daily_demand(daily_demand: Any) -> None:
-    """
-    daily_demand yapısını doğrular:
-        { "YYYY-MM-DD": { origin: { dest: float } } }
-    """
-    if not isinstance(daily_demand, dict):
-        raise DataContractError("daily_demand bir dict olmalıdır.")
-
-    for date_str, origins in daily_demand.items():
-        if not isinstance(origins, dict):
-            raise DataContractError(
-                f"daily_demand['{date_str}'] bir dict olmalıdır."
-            )
-        for origin, destinations in origins.items():
-            if not isinstance(destinations, dict):
-                raise DataContractError(
-                    f"daily_demand['{date_str}']['{origin}'] "
-                    f"bir dict olmalıdır."
-                )
-            for dest, desi in destinations.items():
-                if not isinstance(desi, (int, float)) or desi < 0:
-                    raise DataContractError(
-                        f"daily_demand['{date_str}']['{origin}']"
-                        f"['{dest}'] negatif olamaz; alınan: {desi!r}"
-                    )
-
-
-def _validate_vehicles_info(vehicles_info: Any) -> None:
-    """
-    vehicles_info yapısını doğrular:
-        { vehicle_type: { "name": str, "capacity_desi": number, ... } }
-    """
-    if not isinstance(vehicles_info, dict):
-        raise DataContractError("vehicles_info bir dict olmalıdır.")
+def _sanitize_vehicles_info(vehicles_info: dict) -> dict:
+    clean: dict = {}
     for vtype, info in vehicles_info.items():
-        if not isinstance(info, dict):
-            raise DataContractError(
-                f"vehicles_info['{vtype}'] bir dict olmalıdır."
-            )
-        if "capacity_desi" not in info:
-            raise DataContractError(
-                f"vehicles_info['{vtype}'] 'capacity_desi' alanını içermiyor."
-            )
+        if not isinstance(info, dict) or "capacity_desi" not in info:
+            log.warning("vehicles_info['%s'] atlandı (geçersiz yapı).", vtype)
+            continue
         cap = info["capacity_desi"]
         if not isinstance(cap, (int, float)) or cap <= 0:
-            raise DataContractError(
-                f"vehicles_info['{vtype}']['capacity_desi'] pozitif sayı olmalıdır; "
-                f"alınan: {cap!r}"
+            log.warning("vehicles_info['%s'] atlandı (kapasite geçersiz: %r).", vtype, cap)
+            continue
+        clean[vtype] = info
+    if not clean:
+        raise DataContractError("vehicles_info'da geçerli araç tipi yok (iskelet bozuk).")
+    return clean
+
+
+def _resolve_spot_capacities(data: dict, vehicles_info: dict) -> dict:
+    """
+    spot_capacities yoksa/boşsa vehicles_info'dan türetir (SSoT + graceful).
+    Varsa geçersiz değerleri atlar; hepsi geçersizse yine türetir.
+    """
+    def _derive() -> dict:
+        return {v: info["capacity_desi"] for v, info in vehicles_info.items()}
+
+    raw = data.get("spot_capacities")
+    if not isinstance(raw, dict) or not raw:
+        derived = _derive()
+        log.warning("spot_capacities eksik/boş; vehicles_info'dan türetildi (%d tip).", len(derived))
+        return derived
+
+    clean: dict = {}
+    for vtype, cap in raw.items():
+        if not isinstance(cap, (int, float)) or cap <= 0:
+            log.warning("spot_capacities['%s'] atlandı (geçersiz: %r).", vtype, cap)
+            continue
+        clean[vtype] = cap
+    if not clean:
+        derived = _derive()
+        log.warning("spot_capacities tümü geçersiz; vehicles_info'dan türetildi.")
+        return derived
+    return clean
+
+
+def _sanitize_distance_matrix(dist_matrix: dict) -> dict:
+    clean: dict = {}
+    skipped = 0
+    for origin, dests in dist_matrix.items():
+        if not isinstance(dests, dict):
+            log.warning("distance_matrix['%s'] atlandı (dict değil).", origin)
+            continue
+        valid = {}
+        for dest, dist in dests.items():
+            if isinstance(dist, (int, float)) and dist >= 0:
+                valid[dest] = dist
+            else:
+                skipped += 1
+        clean[origin] = valid
+    if skipped:
+        log.warning("distance_matrix: %d geçersiz mesafe atlandı.", skipped)
+    if not clean:
+        raise DataContractError("distance_matrix boş/geçersiz (iskelet bozuk).")
+    return clean
+
+
+def _sanitize_rental_routes(rental_routes: dict, known_cities: set) -> dict:
+    clean: dict = {}
+    skipped_routes = 0
+    skipped_vehicles = 0
+    for route_key, vehicles in rental_routes.items():
+        if "_" not in route_key or not isinstance(vehicles, list):
+            log.warning("rental_routes['%s'] atlandı (anahtar/liste geçersiz).", route_key)
+            skipped_routes += 1
+            continue
+        origin, dest = route_key.split("_", 1)
+        if origin not in known_cities or dest not in known_cities:
+            log.warning(
+                "rental_routes['%s'] atlandı (şehir distance_matrix'te yok).", route_key
             )
+            skipped_routes += 1
+            continue
+        valid = []
+        for v in vehicles:
+            if not isinstance(v, dict) or "id" not in v or "capacity_desi" not in v:
+                skipped_vehicles += 1
+                continue
+            cap = v["capacity_desi"]
+            if not isinstance(cap, (int, float)) or cap <= 0:
+                skipped_vehicles += 1
+                continue
+            valid.append(v)
+        if valid:
+            clean[route_key] = valid
+        else:
+            skipped_routes += 1
+    if skipped_routes or skipped_vehicles:
+        log.warning(
+            "rental_routes: %d rota, %d araç atlandı.", skipped_routes, skipped_vehicles
+        )
+    return clean
 
 
-def _validate_demand_coherence(daily_demand: dict, distance_matrix: dict) -> None:
-    """daily_demand'daki şehirlerin distance_matrix'te var olduğunu doğrular."""
-    known_cities = set(distance_matrix.keys())
+def _sanitize_cost_matrix(cost_matrix: dict, known_types: set) -> dict:
+    """
+    Her (origin, dest, vtype) kaydında geçerli bir kiralık fiyatı VE 'spot'
+    fiyatı (negatif olmayan sayı) bulunmalı; aksi halde o kayıt atlanır.
+    vehicles_info'da tanımsız araç tipleri de atlanır.
+    """
+    def _ok(x: Any) -> bool:
+        return isinstance(x, (int, float)) and x >= 0
+
+    clean: dict = {}
+    skipped = 0
+    for origin, dests in cost_matrix.items():
+        if not isinstance(dests, dict):
+            continue
+        clean_dests: dict = {}
+        for dest, vehicle_costs in dests.items():
+            if not isinstance(vehicle_costs, dict):
+                continue
+            clean_vtypes: dict = {}
+            for vtype, prices in vehicle_costs.items():
+                if vtype not in known_types or not isinstance(prices, dict):
+                    skipped += 1
+                    continue
+                rental = next((prices[k] for k in _RENTAL_PRICE_KEYS if k in prices), None)
+                if not _ok(rental) or not _ok(prices.get("spot")):
+                    skipped += 1
+                    continue
+                clean_vtypes[vtype] = prices
+            if clean_vtypes:
+                clean_dests[dest] = clean_vtypes
+        if clean_dests:
+            clean[origin] = clean_dests
+    if skipped:
+        log.warning("cost_matrix: %d geçersiz fiyat kaydı atlandı.", skipped)
+    return clean
+
+
+def _sanitize_daily_demand(daily_demand: dict, known_cities: set) -> dict:
+    clean: dict = {}
+    skipped = 0
     for date_str, origins in daily_demand.items():
-        for origin, destinations in origins.items():
-            if origin not in known_cities:
-                raise DataContractError(
-                    f"daily_demand['{date_str}'] kaynağı '{origin}' "
-                    f"distance_matrix'te tanımlı değil."
-                )
-            for dest in destinations:
-                if dest not in known_cities:
-                    raise DataContractError(
-                        f"daily_demand['{date_str}']['{origin}'] hedefi '{dest}' "
-                        f"distance_matrix'te tanımlı değil."
-                    )
-
-
-def _validate_schema(data: dict[str, Any]) -> None:
-    """Tüm doğrulama adımlarını sırayla çalıştırır."""
-    _validate_top_level(data)
-    _validate_vehicles_info(data["vehicles_info"])
-    _validate_distance_matrix(data["distance_matrix"])
-    _validate_rental_routes(data["rental_routes"])
-    _validate_cost_matrix(data["cost_matrix"], data["vehicles_info"])
-    _validate_daily_demand(data["daily_demand"])
-    _validate_demand_coherence(data["daily_demand"], data["distance_matrix"])
+        try:
+            date.fromisoformat(date_str)
+        except (ValueError, TypeError):
+            log.warning("daily_demand: '%s' geçersiz tarih anahtarı, atlandı.", date_str)
+            continue
+        if not isinstance(origins, dict):
+            continue
+        clean_origins: dict = {}
+        for origin, dests in origins.items():
+            if origin not in known_cities or not isinstance(dests, dict):
+                skipped += len(dests) if isinstance(dests, dict) else 1
+                continue
+            valid = {}
+            for dest, desi in dests.items():
+                if dest in known_cities and isinstance(desi, (int, float)) and desi >= 0:
+                    valid[dest] = desi
+                else:
+                    skipped += 1
+            if valid:
+                clean_origins[origin] = valid
+        if clean_origins:
+            clean[date_str] = clean_origins
+    if skipped:
+        log.warning("daily_demand: %d geçersiz talep kaydı atlandı.", skipped)
+    if not clean:
+        raise DataContractError("daily_demand'da geçerli talep kalmadı (iskelet bozuk).")
+    return clean
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,22 +259,14 @@ def _validate_schema(data: dict[str, Any]) -> None:
 
 def load_input(json_path: str | Path) -> dict[str, Any]:
     """
-    JSON dosyasını okur, şema doğrulamasından geçirir ve Python dict'i döner.
-
-    Parameters
-    ----------
-    json_path : str | Path
-        Girdi JSON dosyasının yolu.
-
-    Returns
-    -------
-    dict[str, Any]
-        Veri sözleşmesine uygun Python sözlüğü.
+    JSON dosyasını okur, iskeleti denetler, alt dalları temizler ve
+    **sağlam** bir Python sözlüğü döndürür.
 
     Raises
     ------
     DataContractError
-        Dosya bulunamazsa, geçerli JSON değilse veya şema ihlali varsa.
+        Yalnızca dosya/JSON/iskelet düzeyinde majör bir bozukluk varsa.
+        Alt dal bozuklukları fırlatmaz; atlanır + uyarılır.
     """
     path = Path(json_path)
 
@@ -292,18 +283,35 @@ def load_input(json_path: str | Path) -> dict[str, Any]:
             f"JSON ayrıştırma hatası [{path.name}]: {exc.msg} (satır {exc.lineno})"
         ) from exc
 
-    log.info("JSON ayrıştırıldı. Şema doğrulaması başlıyor…")
-    _validate_schema(data)
-    log.info("Şema doğrulaması başarılı.")
+    # ── İskelet (hard-fail) ──
+    _require_skeleton(data)
 
-    dates = sorted(data["daily_demand"].keys())
+    # ── Alt dal temizliği (skip + warn) ──
+    vehicles_info = _sanitize_vehicles_info(data["vehicles_info"])
+    distance_matrix = _sanitize_distance_matrix(data["distance_matrix"])
+    known_cities = set(distance_matrix.keys())
+    spot_capacities = _resolve_spot_capacities(data, vehicles_info)
+    rental_routes = _sanitize_rental_routes(data["rental_routes"], known_cities)
+    cost_matrix = _sanitize_cost_matrix(data["cost_matrix"], set(vehicles_info.keys()))
+    daily_demand = _sanitize_daily_demand(data["daily_demand"], known_cities)
+
+    # Ekstra anahtarları (city_coords, vehicle_types, tir_yanasma…) koru
+    cleaned = dict(data)
+    cleaned.update({
+        "vehicles_info":   vehicles_info,
+        "spot_capacities": spot_capacities,
+        "distance_matrix": distance_matrix,
+        "rental_routes":   rental_routes,
+        "cost_matrix":     cost_matrix,
+        "daily_demand":    daily_demand,
+    })
+
+    dates = sorted(daily_demand.keys())
     log.info(
-        "Yüklenen tarihler (%d adet): %s",
-        len(dates),
-        ", ".join(dates) if len(dates) <= 5 else f"{dates[:3]} … {dates[-1]}",
+        "Yüklendi: %d tarih, %d şehir, %d araç tipi, %d kiralık rota.",
+        len(dates), len(known_cities), len(vehicles_info), len(rental_routes),
     )
-
-    return data
+    return cleaned
 
 
 def available_dates(data: dict[str, Any]) -> list[str]:

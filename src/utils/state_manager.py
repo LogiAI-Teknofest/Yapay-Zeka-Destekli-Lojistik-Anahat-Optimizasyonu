@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 import redis as _redis
@@ -7,6 +7,7 @@ import redis as _redis
 from .config import REDIS_HOST, REDIS_PORT, REDIS_DB
 
 logger = logging.getLogger(__name__)
+_MAX_RETRIES = 3
 
 # Modül düzeyinde paylaşılan tek ConnectionPool — her RedisStateManager()
 # örneği aynı havuzu kullanır, her çağrıda yeni TCP soketi açılmaz.
@@ -21,15 +22,28 @@ _pool = _redis.ConnectionPool(
 ECHELON_FIRST  = "1"
 ECHELON_SECOND = "2"
 
+# Bağlantı yalnızca süreç başına bir kez ping ile doğrulanır; her
+# RedisStateManager() örneğinde tekrar round-trip yapılmaz.
+_connection_verified = False
+
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 class RedisStateManager:
     def __init__(self):
+        global _connection_verified
         self.redis: _redis.Redis = _redis.Redis(connection_pool=_pool)
-        try:
-            self.redis.ping()
-        except Exception as exc:
-            logger.error(f"Redis baglantisi kurulamadi: {exc}")
-            raise
+        # Bağlantı kontrolü süreç başına bir kez (fail-fast); sonraki
+        # örnekler aynı havuzu kullandığından ping tekrarlanmaz.
+        if not _connection_verified:
+            try:
+                self.redis.ping()
+                _connection_verified = True
+            except Exception as exc:
+                logger.error(f"Redis baglantisi kurulamadi: {exc}")
+                raise
 
     # ── Reset ────────────────────────────────────────────────────────────────
 
@@ -56,7 +70,7 @@ class RedisStateManager:
         """
         vehicles_info = data.get("vehicles_info", {})
         pipe = self.redis.pipeline()
-        now = datetime.now().isoformat()
+        now = _now_utc_iso()
         seen: set = set()
         for vehicles in data.get("rental_routes", {}).values():
             for v in vehicles:
@@ -108,19 +122,56 @@ class RedisStateManager:
 
     def list_tm_states(self) -> List[Dict]:
         tm_keys = list(self.redis.scan_iter(match="TM:*:State"))
-        tm_ids = [k.replace("TM:", "").replace(":State", "") for k in tm_keys]
-        return [self.get_tm_state(tm_id) for tm_id in tm_ids]
+        if not tm_keys:
+            return []
+        pipe = self.redis.pipeline()
+        for key in tm_keys:
+            pipe.hgetall(key)
+        raws = pipe.execute()
+        states = []
+        for key, raw in zip(tm_keys, raws):
+            tm_id = key.replace("TM:", "").replace(":State", "")
+            states.append({
+                "tm_id":         tm_id,
+                "max_cap":       int(float(raw.get("MaxCapacity", 0))),
+                "current":       float(raw.get("CurrentLoad", 0)),
+                "overload":      float(raw.get("OverloadAmount", 0)),
+                "accepts_truck": raw.get("AcceptsTruck", "0") == "1",
+                "updated_at":    raw.get("UpdatedAt", "-"),
+            })
+        return states
 
     def list_vehicle_states(self) -> List[Dict]:
         vehicle_keys = list(self.redis.scan_iter(match="Vehicle:*:State"))
-        vehicle_ids = [k.replace("Vehicle:", "").replace(":State", "") for k in vehicle_keys]
-        return [self.get_vehicle_state(vid) for vid in vehicle_ids]
+        if not vehicle_keys:
+            return []
+        pipe = self.redis.pipeline()
+        for key in vehicle_keys:
+            pipe.hgetall(key)
+        raws = pipe.execute()
+        states = []
+        for key, raw in zip(vehicle_keys, raws):
+            vehicle_id = key.replace("Vehicle:", "").replace(":State", "")
+            states.append({
+                "vehicle_id": vehicle_id,
+                "type":       raw.get("Type", "Bilinmiyor"),
+                "max_cap":    int(float(raw.get("MaxCapacity", 1))),
+                "current":    float(raw.get("CurrentLoad", 0)),
+                "location":   raw.get("Location", "Depo"),
+                "updated_at": raw.get("UpdatedAt", "-"),
+            })
+        return states
 
     def get_total_overload(self) -> float:
         """Tum TM'lerin toplam delta_i asim miktari."""
+        tm_keys = list(self.redis.scan_iter(match="TM:*:State"))
+        if not tm_keys:
+            return 0.0
+        pipe = self.redis.pipeline()
+        for key in tm_keys:
+            pipe.hget(key, "OverloadAmount")
         total = 0.0
-        for key in self.redis.scan_iter(match="TM:*:State"):
-            raw = self.redis.hget(key, "OverloadAmount")
+        for raw in pipe.execute():
             if raw:
                 total += float(raw)
         return total
@@ -136,37 +187,67 @@ class RedisStateManager:
         vehicle_key = f"Vehicle:{vehicle_id}:State"
         tm_key      = f"TM:{package['tm_id']}:State"
         desi        = float(package["desi"])
+        for attempt in range(_MAX_RETRIES):
+            try:
+                with self.redis.pipeline() as pipe:
+                    pipe.watch(vehicle_key, tm_key)
+                    vehicle_raw = pipe.hgetall(vehicle_key)
+                    tm_raw = pipe.hgetall(tm_key)
 
-        tm_state      = self.get_tm_state(package["tm_id"])
-        vehicle_state = self.get_vehicle_state(vehicle_id)
+                    vehicle_state = {
+                        "max_cap": int(float(vehicle_raw.get("MaxCapacity", 1))),
+                        "current": float(vehicle_raw.get("CurrentLoad", 0)),
+                    }
+                    tm_state = {
+                        "max_cap": int(float(tm_raw.get("MaxCapacity", 0))),
+                        "current": float(tm_raw.get("CurrentLoad", 0)),
+                    }
 
-        # Arac kapasitesi — sert kisit
-        if vehicle_state["current"] + desi > vehicle_state["max_cap"]:
-            logger.info(
-                f"Yuklenemedi: {vehicle_id} dolu "
-                f"(gerekli={desi:.1f}, kalan={vehicle_state['max_cap'] - vehicle_state['current']:.1f})"
-            )
-            return False
+                    if vehicle_state["current"] + desi > vehicle_state["max_cap"]:
+                        pipe.unwatch()
+                        logger.info(
+                            f"Yuklenemedi: {vehicle_id} dolu "
+                            f"(gerekli={desi:.1f}, kalan={vehicle_state['max_cap'] - vehicle_state['current']:.1f})"
+                        )
+                        return False
 
-        now = datetime.now().isoformat()
-        pipe = self.redis.pipeline()
-        pipe.hincrbyfloat(vehicle_key, "CurrentLoad", desi)
-        pipe.hset(vehicle_key, "UpdatedAt", now)
-        pipe.hincrbyfloat(tm_key, "CurrentLoad", desi)
-        pipe.hset(tm_key, "UpdatedAt", now)
+                    now = _now_utc_iso()
+                    new_tm_load = tm_state["current"] + desi
+                    overload_amount = 0.0
+                    if tm_state["max_cap"] > 0 and new_tm_load > tm_state["max_cap"]:
+                        overload_amount = new_tm_load - tm_state["max_cap"]
 
-        # TM elleçleme — esnek kisit (delta_i)
-        new_tm_load = tm_state["current"] + desi
-        if tm_state["max_cap"] > 0 and new_tm_load > tm_state["max_cap"]:
-            overload_delta = new_tm_load - tm_state["max_cap"]
-            pipe.hincrbyfloat(tm_key, "OverloadAmount", overload_delta)
+                    pipe.multi()
+                    pipe.hincrbyfloat(vehicle_key, "CurrentLoad", desi)
+                    pipe.hset(vehicle_key, "UpdatedAt", now)
+                    pipe.hincrbyfloat(tm_key, "CurrentLoad", desi)
+                    pipe.hset(tm_key, mapping={
+                        "UpdatedAt": now,
+                        "OverloadAmount": overload_amount,
+                    })
+                    pipe.execute()
+                    logger.info(
+                        f"Yuklendi: {package.get('pkg_id', '?')} -> {vehicle_id} / "
+                        f"TM:{package['tm_id']} ({desi:.1f} desi)"
+                    )
+                    return True
+            except _redis.WatchError:
+                logger.debug(
+                    "try_load_package WatchError (attempt %d/%d) vehicle=%s tm=%s",
+                    attempt + 1,
+                    _MAX_RETRIES,
+                    vehicle_id,
+                    package["tm_id"],
+                )
+                continue
 
-        pipe.execute()
-        logger.info(
-            f"Yuklendi: {package.get('pkg_id', '?')} -> {vehicle_id} / "
-            f"TM:{package['tm_id']} ({desi:.1f} desi)"
+        logger.warning(
+            "try_load_package: max retries (%d) aşıldı vehicle=%s tm=%s",
+            _MAX_RETRIES,
+            vehicle_id,
+            package["tm_id"],
         )
-        return True
+        return False
 
     def apply_route_loads(self, route_packages: Dict[str, List[Dict]]) -> Dict[str, List]:
         loaded, failed = [], []
@@ -182,8 +263,10 @@ class RedisStateManager:
 
     def update_eta(self, vehicle_id: str, tm_id: str, eta_ts: int) -> None:
         """Arac -> TM tahmini varis zamanini ZSET'e yaz (score = unix timestamp)."""
-        self.redis.zadd(f"ETA:TM:{tm_id}",      {vehicle_id: eta_ts})
-        self.redis.zadd(f"ETA:Vehicle:{vehicle_id}", {tm_id: eta_ts})
+        pipe = self.redis.pipeline()
+        pipe.zadd(f"ETA:TM:{tm_id}", {vehicle_id: eta_ts})
+        pipe.zadd(f"ETA:Vehicle:{vehicle_id}", {tm_id: eta_ts})
+        pipe.execute()
         logger.info(f"ETA guncellendi: {vehicle_id} -> TM:{tm_id} @ {eta_ts}")
 
     def get_next_vehicle_eta(self, tm_id: str) -> Optional[Tuple[str, int]]:
@@ -215,7 +298,7 @@ class RedisStateManager:
         Echelon 1 = kucuk arac -> TM toplama  (2E-VRP first leg, MVP'de pasif)
         Echelon 2 = buyuk arac -> ana hedef   (2E-VRP second leg, MVP'de aktif)
         """
-        ts  = ts or datetime.now().strftime("%Y%m%d%H%M%S")
+        ts  = ts or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         key = f"Route:{vehicle_id}:Echelon:{echelon}:{ts}"
         pipe = self.redis.pipeline()
         for stop in route:
