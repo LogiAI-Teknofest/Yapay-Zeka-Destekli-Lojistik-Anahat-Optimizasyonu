@@ -1,1 +1,0 @@
-# Yapay-Zeka-Destekli-Lojistik-Anahat-Optimizasyonu

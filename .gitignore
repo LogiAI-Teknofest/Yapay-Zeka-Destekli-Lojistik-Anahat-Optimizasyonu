@@ -21,6 +21,7 @@ env/
 *.njsproj
 *.sln
 *.swp
+.planning
 
 # === Yarışma Veri Setleri ve Çıktılar ===
 # Gerçek veri setleri (.xlsx veya .csv) ve yerel test çıktıları büyük boyutlu 
