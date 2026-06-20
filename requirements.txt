@@ -1,3 +1,17 @@
+# ════════════════════════════════════════════════════════════════════
+#  KÖK requirements.txt — optimizasyon/çekirdek modüllerin bağımlılıkları
+# ════════════════════════════════════════════════════════════════════
+#  DİKKAT (Kişi D notu):
+#  - Bu dosya Docker imajları ve start.sh tarafından KULLANILMIYOR.
+#    API imajı  -> src/app/requirements.txt
+#    Dashboard  -> src/app/dashboard_requirements.txt
+#  - Sürümler src/app/requirements.txt ile ÇELİŞİYOR:
+#       burada: numpy==2.4.5, pandas==3.0.3
+#       api'de: numpy>=2.0.2, pandas==2.2.2
+#    Aynı ortama ikisi birden kurulursa çakışır.
+#  - TODO: Bu dosyanın amacı/sahibi ekiple netleştirilmeli; gerekiyorsa
+#    sürümler tek kaynakta birleştirilmeli. Pinlere şimdilik dokunulmadı.
+# ════════════════════════════════════════════════════════════════════
 absl-py==2.4.0
 immutabledict==4.3.1
 numpy==2.4.5

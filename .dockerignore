@@ -1,0 +1,34 @@
+# ── Docker build context dışı tutulacaklar ──
+# Sanal ortamlar (imaja girmemeli — bağımlılıklar requirements'tan kurulur)
+venv_*/
+.venv/
+venv/
+ENV/
+env/
+
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Versiyon kontrolü ve IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Testler ve yerel çıktılar (runtime imajına gerek yok)
+tests/
+outputs/
+test_outputs/
+*.xlsx
+*.xls
+*.csv
+
+# Dokümantasyon / raporlar
+*.md
+*.pdf
+
+# İşletim sistemi dosyaları
+.DS_Store
+Thumbs.db

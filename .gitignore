@@ -8,6 +8,7 @@ __pycache__/
 # .venv klasörü her bilgisayara özeldir, ASLA pushlanmamalıdır
 .venv/
 venv/
+venv_*/
 ENV/
 env/
 
@@ -42,5 +43,4 @@ Desktop.ini
 *.pdf
 *.json
 tum_kodlar.txt
-.py
 

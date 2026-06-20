@@ -9,7 +9,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/app/data:z          # ham veri + işlenmiş çıktılar host'tan mount (z flag'i ile)
+      - ./data:/app/data:z
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -44,7 +44,7 @@ services:
     image: redis:7-alpine
     container_name: logiai-redis
     volumes:
-      - redis_data:/data            # kalıcı veri
+      - redis_data:/data
     restart: unless-stopped
 
 volumes:

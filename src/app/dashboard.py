@@ -13,16 +13,13 @@ Sayfalar:
 
 import math
 import os
-import time
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 import folium
 import folium.plugins
-import json
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
-import numpy as np
 import requests
 import streamlit as st
 from streamlit_folium import st_folium
@@ -47,9 +44,27 @@ def _init_state():
     st.session_state.setdefault("running", False)
     st.session_state.setdefault("_job_ids", {})   # {cache_key: job_id}
     st.session_state.setdefault("_results", {})   # {cache_key: result}
+    st.session_state.setdefault("_poll_fails", {})  # {cache_key: ardışık başarısız poll sayısı}
+
+
+# FIX — Sonsuz rerun guard: API/Redis erişilemezse poll sürekli None döner.
+# Ardışık başarısızlık bu eşiği aşınca job iptal edilir ve döngü kırılır.
+_MAX_POLL_FAILS = 5
 
 
 _init_state()
+
+
+# FIX — Tarih seçici artık API'deki gerçek tarihlerden besleniyor (veride
+# olmayan tarih seçilip 404 alınmasını önler).
+@st.cache_data(ttl=60)
+def load_dates() -> list:
+    try:
+        r = _session.get(f"{API_BASE}/api/dates", timeout=10)
+        r.raise_for_status()
+        return r.json().get("tarihler", [])
+    except Exception:
+        return []
 
 
 # ── Sidebar ──
@@ -69,12 +84,22 @@ with st.sidebar:
     st.divider()
 
     st.subheader("⚙️ Parametreler")
-    planlama_tarihi = st.date_input(
-        "Planlama Tarihi",
-        value=datetime(2026, 1, 15),
-        min_value=datetime(2026, 1, 1),
-        max_value=datetime(2026, 5, 10),
-    )
+    _available_dates = load_dates()
+    if _available_dates:
+        _sel_date = st.selectbox(
+            "Planlama Tarihi",
+            _available_dates,
+            index=0,
+            help="Yalnızca veride bulunan tarihler listelenir.",
+        )
+        planlama_tarihi = datetime.fromisoformat(_sel_date)
+    else:
+        # API'den tarih alınamadıysa serbest seçime düş
+        st.warning("Tarih listesi API'den alınamadı — serbest seçim aktif.")
+        planlama_tarihi = st.date_input(
+            "Planlama Tarihi",
+            value=datetime(2026, 1, 15),
+        )
 
     time_limit_sec = st.slider("OR-Tools Süre Sınırı (sn)", 10, 600, 60, 10)
 
@@ -167,9 +192,23 @@ def get_optimization_result(tarih: str, time_limit: int) -> dict | None:
     if job_id:
         job = _poll_job(job_id)
         if job is None:
-            st.warning("Job durumu alınamadı, yeniden deneniyor...")
+            # FIX — Sonsuz rerun guard: ardışık başarısızlıkları say
+            fails = st.session_state["_poll_fails"].get(cache_key, 0) + 1
+            st.session_state["_poll_fails"][cache_key] = fails
+            if fails >= _MAX_POLL_FAILS:
+                st.error(
+                    f"Job durumu {fails} denemede alınamadı. API veya Redis "
+                    f"erişilemiyor olabilir. Optimizasyon iptal edildi."
+                )
+                st.session_state["_job_ids"].pop(cache_key, None)
+                st.session_state["_poll_fails"].pop(cache_key, None)
+                st.session_state["running"] = False
+                return None
+            st.warning(f"Job durumu alınamadı, yeniden deneniyor... ({fails}/{_MAX_POLL_FAILS})")
             st.rerun()  # FIX #18 — sleep yok
             return None
+        # Başarılı poll — sayaç sıfırla
+        st.session_state["_poll_fails"].pop(cache_key, None)
         if job["status"] == "COMPLETED":
             st.session_state["_results"][cache_key] = job["result"]
             del st.session_state["_job_ids"][cache_key]
@@ -184,9 +223,13 @@ def get_optimization_result(tarih: str, time_limit: int) -> dict | None:
         elapsed = ""
         if job.get("started_at"):
             try:
-                secs = (datetime.utcnow() - datetime.fromisoformat(
-                    job["started_at"].replace("Z", "+00:00").replace("+00:00", "")
-                )).seconds
+                # FIX — timezone-aware karşılaştırma (datetime.utcnow() deprecated)
+                started = datetime.fromisoformat(
+                    job["started_at"].replace("Z", "+00:00")
+                )
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                secs = int((datetime.now(timezone.utc) - started).total_seconds())
                 elapsed = f" (~{secs} sn)"
             except Exception:
                 pass
