@@ -161,6 +161,21 @@ def test_graceful_skip():
     finally:
         os.unlink(path)
 
+    print("\n  [2g] rental_routes'ta vehicles_info'da olmayan vehicle_type → arac atlanir (#54)")
+    data = copy.deepcopy(_BASE)
+    data["rental_routes"]["A_B"].append(
+        {"id": "KIR_XYZ_01", "vehicle_type": "BilinmeyenTip", "capacity_desi": 100}
+    )
+    path = _write_tmp(data)
+    try:
+        d = load_input(path)
+        ids = [v["id"] for v in d["rental_routes"].get("A_B", [])]
+        assert "KIR_XYZ_01" not in ids, "bilinmeyen tipli arac atlanmaliydi"
+        assert "KIR_TIR_01" in ids, "saglam arac korunmaliydi"
+        print("  [OK]  Bilinmeyen vehicle_type atlandi, saglam arac korundu")
+    finally:
+        os.unlink(path)
+
     print("\n  [2e] spot_capacities eksik → vehicles_info'dan türetilir")
     data = copy.deepcopy(_BASE)
     del data["spot_capacities"]

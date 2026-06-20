@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -32,18 +33,24 @@ def _now_utc_iso() -> str:
 
 
 class RedisStateManager:
-    def __init__(self):
+    def __init__(self, *, db: int = REDIS_DB):
         global _connection_verified
-        self.redis: _redis.Redis = _redis.Redis(connection_pool=_pool)
-        # Bağlantı kontrolü süreç başına bir kez (fail-fast); sonraki
-        # örnekler aynı havuzu kullandığından ping tekrarlanmaz.
-        if not _connection_verified:
-            try:
-                self.redis.ping()
-                _connection_verified = True
-            except Exception as exc:
-                logger.error(f"Redis baglantisi kurulamadi: {exc}")
-                raise
+        if db == REDIS_DB:
+            # Üretim yolu: paylaşılan pool + süreç-başına tek ping.
+            self.redis: _redis.Redis = _redis.Redis(connection_pool=_pool)
+            if not _connection_verified:
+                try:
+                    self.redis.ping()
+                    _connection_verified = True
+                except Exception as exc:
+                    logger.error(f"Redis baglantisi kurulamadi: {exc}")
+                    raise
+        else:
+            # Test / izole yol (ör. db=REDIS_TEST_DB=15): doğrudan bağlantı,
+            # singleton ping uygulanmaz — üretim DB'sine dokunulmaz (#55).
+            self.redis = _redis.Redis(
+                host=REDIS_HOST, port=REDIS_PORT, db=db, decode_responses=True
+            )
 
     # ── Reset ────────────────────────────────────────────────────────────────
 
@@ -239,6 +246,8 @@ class RedisStateManager:
                     vehicle_id,
                     package["tm_id"],
                 )
+                if attempt < _MAX_RETRIES - 1:
+                    time.sleep(0.01 * (2 ** attempt))  # 10ms, 20ms — exponential backoff
                 continue
 
         logger.warning(
@@ -269,6 +278,17 @@ class RedisStateManager:
         pipe.execute()
         logger.info(f"ETA guncellendi: {vehicle_id} -> TM:{tm_id} @ {eta_ts}")
 
+    def clear_vehicle_eta(self, vehicle_id: str) -> None:
+        """Araç teslim tamamlandı: tüm TM ETA ZSET'lerinden kaldır (zombi önlemi, #55)."""
+        tms = [tm for tm, _ in self.redis.zrange(
+            f"ETA:Vehicle:{vehicle_id}", 0, -1, withscores=True
+        )]
+        pipe = self.redis.pipeline()
+        for tm_id in tms:
+            pipe.zrem(f"ETA:TM:{tm_id}", vehicle_id)
+        pipe.delete(f"ETA:Vehicle:{vehicle_id}")
+        pipe.execute()
+
     def get_next_vehicle_eta(self, tm_id: str) -> Optional[Tuple[str, int]]:
         """TM'ye en erken ulasacak arac ve ETA timestamp'ini dondur."""
         result = self.redis.zrange(f"ETA:TM:{tm_id}", 0, 0, withscores=True)
@@ -298,7 +318,7 @@ class RedisStateManager:
         Echelon 1 = kucuk arac -> TM toplama  (2E-VRP first leg, MVP'de pasif)
         Echelon 2 = buyuk arac -> ana hedef   (2E-VRP second leg, MVP'de aktif)
         """
-        ts  = ts or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        ts  = ts or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
         key = f"Route:{vehicle_id}:Echelon:{echelon}:{ts}"
         pipe = self.redis.pipeline()
         for stop in route:

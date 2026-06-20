@@ -9,6 +9,8 @@ import os
 REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
+# Test izolasyon DB'si — üretim verisi silinmesin (bkz. #55)
+REDIS_TEST_DB: int = int(os.getenv("REDIS_TEST_DB", "15"))
 
 # ─── Optimizer ────────────────────────────────────────────────────────────────
 # Su an aktif kullanim bulunmuyor; env sozlesmesini bozmamak icin rezerve tutuluyor.

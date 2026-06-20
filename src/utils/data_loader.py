@@ -146,7 +146,7 @@ def _sanitize_distance_matrix(dist_matrix: dict) -> dict:
     return clean
 
 
-def _sanitize_rental_routes(rental_routes: dict, known_cities: set) -> dict:
+def _sanitize_rental_routes(rental_routes: dict, known_cities: set, known_types: set) -> dict:
     clean: dict = {}
     skipped_routes = 0
     skipped_vehicles = 0
@@ -169,6 +169,14 @@ def _sanitize_rental_routes(rental_routes: dict, known_cities: set) -> dict:
                 continue
             cap = v["capacity_desi"]
             if not isinstance(cap, (int, float)) or cap <= 0:
+                skipped_vehicles += 1
+                continue
+            vtype = v.get("vehicle_type", "")
+            if vtype not in known_types:
+                log.warning(
+                    "rental_routes['%s'] araç '%s' atlandı (vehicle_type '%s' vehicles_info'da yok).",
+                    route_key, v.get("id", "?"), vtype,
+                )
                 skipped_vehicles += 1
                 continue
             valid.append(v)
@@ -291,7 +299,7 @@ def load_input(json_path: str | Path) -> dict[str, Any]:
     distance_matrix = _sanitize_distance_matrix(data["distance_matrix"])
     known_cities = set(distance_matrix.keys())
     spot_capacities = _resolve_spot_capacities(data, vehicles_info)
-    rental_routes = _sanitize_rental_routes(data["rental_routes"], known_cities)
+    rental_routes = _sanitize_rental_routes(data["rental_routes"], known_cities, set(vehicles_info.keys()))
     cost_matrix = _sanitize_cost_matrix(data["cost_matrix"], set(vehicles_info.keys()))
     daily_demand = _sanitize_daily_demand(data["daily_demand"], known_cities)
 
