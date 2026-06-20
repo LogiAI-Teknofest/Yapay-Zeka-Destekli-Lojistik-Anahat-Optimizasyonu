@@ -23,10 +23,10 @@ from datetime import datetime
 
 import redis
 
-from src.utils.config import REDIS_HOST, REDIS_PORT, REDIS_DB
+from src.utils.config import REDIS_HOST, REDIS_PORT, REDIS_TEST_DB
 
-# config ile aynı host/DB — RedisStateManager farklı DB'ye yazarsa testler kopmaz.
-_r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+# Test izolasyon DB'si (varsayılan 15) — üretim DB'sine dokunulmaz (#55).
+_r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_TEST_DB, decode_responses=True)
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -83,7 +83,7 @@ def test_reset_states():
     _section("TEST 2: reset_states + load_vehicle_state (SSoT — JSON'dan yükleme)")
     try:
         from src.utils.state_manager import RedisStateManager
-        sm = RedisStateManager()
+        sm = RedisStateManager(db=REDIS_TEST_DB)
         sm.reset_states()
 
         # reset_states artık Vehicle key oluşturmuyor; load_vehicle_state çağrılmalı
@@ -109,7 +109,7 @@ def test_load_package():
     _section("TEST 3: try_load_package (hincrbyfloat + sert kisit)")
     try:
         from src.utils.state_manager import RedisStateManager
-        sm = RedisStateManager()
+        sm = RedisStateManager(db=REDIS_TEST_DB)
         data = _load_data()
         sm.load_vehicle_state(data)
         vid, _, cap = _ssot_vehicle(data)   # SSoT: arac id + kapasite JSON'dan
@@ -144,7 +144,7 @@ def test_overload_tracking():
     _section("TEST 4: TM Overload Takibi (delta_i esnek kisit)")
     try:
         from src.utils.state_manager import RedisStateManager
-        sm = RedisStateManager()
+        sm = RedisStateManager(db=REDIS_TEST_DB)
         data = _load_data()
         sm.load_vehicle_state(data)
         vid, _, cap = _ssot_vehicle(data)
@@ -178,7 +178,7 @@ def test_eta_tracking():
     _section("TEST 5: ETA Takibi (ETA:TM:* ZSET)")
     try:
         from src.utils.state_manager import RedisStateManager
-        sm = RedisStateManager()
+        sm = RedisStateManager(db=REDIS_TEST_DB)
         data = _load_data()
         v0, _, _ = _ssot_vehicle(data, 0)
         v1, _, _ = _ssot_vehicle(data, 1)
@@ -208,7 +208,7 @@ def test_route_echelon():
     _section("TEST 6: 2E-VRP Route Key Iskeleti")
     try:
         from src.utils.state_manager import RedisStateManager, ECHELON_FIRST, ECHELON_SECOND
-        sm = RedisStateManager()
+        sm = RedisStateManager(db=REDIS_TEST_DB)
         data = _load_data()
         vid, _, _ = _ssot_vehicle(data, 0)
         vid2, _, _ = _ssot_vehicle(data, 1)
@@ -241,7 +241,7 @@ def test_apply_route_loads():
         from src.utils.state_manager import RedisStateManager
         from tests.mock_generator import generate_tm_demand_items
 
-        sm = RedisStateManager()
+        sm = RedisStateManager(db=REDIS_TEST_DB)
         data = _load_data()
         sm.load_vehicle_state(data)
 
@@ -358,7 +358,7 @@ def run_all_tests():
         if needs_redis and name != "Redis Baglantisi":
             try:
                 from src.utils.state_manager import RedisStateManager
-                RedisStateManager().reset_states()
+                RedisStateManager(db=REDIS_TEST_DB).reset_states()
             except Exception:
                 redis_ok = False
                 _section(f"TEST SKIP: {name}")
