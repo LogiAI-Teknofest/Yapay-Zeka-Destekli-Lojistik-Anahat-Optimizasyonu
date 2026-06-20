@@ -169,6 +169,8 @@ def _poll_job(job_id: str) -> dict | None:
         r.raise_for_status()  # FIX #34
         return r.json()
     except Exception as e:  # FIX #27
+        import logging
+        logging.getLogger(__name__).exception("Job polling failed")
         st.warning(f"Job sorgulanamadı: {e}")
         return None
 
@@ -205,6 +207,8 @@ def get_optimization_result(tarih: str, time_limit: int) -> dict | None:
                 st.session_state["running"] = False
                 return None
             st.warning(f"Job durumu alınamadı, yeniden deneniyor... ({fails}/{_MAX_POLL_FAILS})")
+            import time
+            time.sleep(3)
             st.rerun()  # FIX #18 — sleep yok
             return None
         # Başarılı poll — sayaç sıfırla
@@ -234,6 +238,8 @@ def get_optimization_result(tarih: str, time_limit: int) -> dict | None:
             except Exception:
                 pass
         st.info(f"⏳ Optimizasyon çalışıyor{elapsed}... (durum: {job['status']})")
+        import time
+        time.sleep(3)
         st.rerun()  # FIX #18 — sleep yok, doğrudan rerun
         return None
 
