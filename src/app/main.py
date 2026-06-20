@@ -428,7 +428,7 @@ def _fleet_skeleton(mtime: float) -> tuple[dict, ...]:
         for v in vehicles:
             vtype = v.get("vehicle_type", "Tir")
             cost_row = data.get("cost_matrix", {}).get(origin, {}).get(dest, {}).get(vtype, {})
-            sabit = float(cost_row.get("kiralik", cost_row.get("kiralik", 0)))
+            sabit = float(cost_row.get("kiralik", cost_row.get("kiralık", 0)))
             rows.append({
                 "arac_id": v["id"],
                 "tip": vtype,
