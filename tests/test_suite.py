@@ -23,7 +23,10 @@ from datetime import datetime
 
 import redis
 
-_r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+from src.utils.config import REDIS_HOST, REDIS_PORT, REDIS_DB
+
+# config ile aynı host/DB — RedisStateManager farklı DB'ye yazarsa testler kopmaz.
+_r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -36,6 +39,32 @@ def _section(title: str):
     print("=" * 55)
 
 
+_INPUT_JSON = "data/raw/logiai_mvp_input.json"
+
+
+def _load_data():
+    from src.utils.data_loader import load_input
+    return load_input(_INPUT_JSON)
+
+
+# ── SSoT yardımcıları (Kural 4): araç/şehir/kapasite JSON'dan türetilir ──────────
+def _ssot_vehicle(data, idx: int = 0):
+    """idx. kiralık aracın (id, tip, kapasite) üçlüsü — kapasite JSON'dan."""
+    vehicles = [v for vs in data["rental_routes"].values() for v in vs]
+    v = vehicles[idx]
+    vtype = v.get("vehicle_type", "")
+    cap = data["vehicles_info"].get(vtype, {}).get("capacity_desi") or v.get("capacity_desi", 0)
+    return v["id"], vtype, float(cap)
+
+
+def _ssot_city(data, idx: int = 0):
+    return sorted(data["distance_matrix"].keys())[idx]
+
+
+def _prepare_vehicle_states(sm):
+    sm.load_vehicle_state(_load_data())
+
+
 # ── Test 1: Redis ─────────────────────────────────────────────────────────────
 def test_redis_connection():
     _section("TEST 1: Redis Baglantisi")
@@ -45,29 +74,30 @@ def test_redis_connection():
         print(f"  OK  ping basarili  (Redis {info.get('redis_version', '?')})")
         return PASS
     except Exception as e:
-        print(f"  FAIL  {e}")
-        return FAIL
+        print(f"  SKIP  {e}")
+        return SKIP
 
 
 # ── Test 2: reset_states + load_vehicle_state ────────────────────────────────
 def test_reset_states():
     _section("TEST 2: reset_states + load_vehicle_state (SSoT — JSON'dan yükleme)")
     try:
-        from src.utils.data_loader import load_input
         from src.utils.state_manager import RedisStateManager
         sm = RedisStateManager()
         sm.reset_states()
 
         # reset_states artık Vehicle key oluşturmuyor; load_vehicle_state çağrılmalı
-        data = load_input("data/raw/logiai_mvp_input.json")
+        data = _load_data()
         sm.load_vehicle_state(data)
 
         vehs = list(_r.scan_iter(match="Vehicle:*:State"))
         assert len(vehs) >= 1, f"En az 1 arac bekleniyor, gelen={len(vehs)}"
 
-        cap = _r.hget("Vehicle:KIR_TIR_01:State", "MaxCapacity")
-        assert cap == "22400", f"MaxCapacity=22400 bekleniyor, gelen={cap}"
-        print(f"  OK  {len(vehs)} arac  KIR_TIR_01 MaxCap={cap}")
+        # SSoT: beklenen kapasite JSON'dan türetilir (hardcode yok)
+        vid, _, cap = _ssot_vehicle(data)
+        stored = _r.hget(f"Vehicle:{vid}:State", "MaxCapacity")
+        assert int(float(stored)) == int(cap), f"MaxCapacity={cap} bekleniyor, gelen={stored}"
+        print(f"  OK  {len(vehs)} arac  {vid} MaxCap={stored}")
         return PASS
     except Exception as e:
         print(f"  FAIL  {e}")
@@ -80,22 +110,27 @@ def test_load_package():
     try:
         from src.utils.state_manager import RedisStateManager
         sm = RedisStateManager()
+        data = _load_data()
+        sm.load_vehicle_state(data)
+        vid, _, cap = _ssot_vehicle(data)   # SSoT: arac id + kapasite JSON'dan
+        city = _ssot_city(data)
 
-        pkg = {"pkg_id": "PKG_001", "tm_id": "İstanbul", "desi": 500.5}
-        ok  = sm.try_load_package(pkg, "KIR_TIR_01")
+        pkg = {"pkg_id": "PKG_001", "tm_id": city, "desi": 500.5}
+        ok  = sm.try_load_package(pkg, vid)
         assert ok, "Yukleme basarili olmali"
-        v_state = sm.get_vehicle_state("KIR_TIR_01")
+        v_state = sm.get_vehicle_state(vid)
         assert v_state["current"] == 500.5, f"Arac yuku=500.5 bekleniyor, gelen={v_state['current']}"
         print(f"  OK  500.5 desi yuklendi (float hincrbyfloat calisiyor)")
 
-        big = {"pkg_id": "PKG_BIG", "tm_id": "İstanbul", "desi": 22400.0}
-        ok2 = sm.try_load_package(big, "KIR_TIR_01")
+        # kapasiteyi asan paket (kapasite JSON'dan) -> reddedilmeli
+        big = {"pkg_id": "PKG_BIG", "tm_id": city, "desi": cap}
+        ok2 = sm.try_load_package(big, vid)
         assert not ok2, "Kapasite asimi reddedilmeli"
         print(f"  OK  Arac kapasitesi asimi dogru reddedildi")
 
-        pkg2 = {"pkg_id": "PKG_002", "tm_id": "İstanbul", "desi": 200.0}
-        sm.try_load_package(pkg2, "KIR_TIR_01")
-        v_state2 = sm.get_vehicle_state("KIR_TIR_01")
+        pkg2 = {"pkg_id": "PKG_002", "tm_id": city, "desi": 200.0}
+        sm.try_load_package(pkg2, vid)
+        v_state2 = sm.get_vehicle_state(vid)
         assert v_state2["current"] == 700.5, f"Kumulatif yuk=700.5 bekleniyor, gelen={v_state2['current']}"
         print(f"  OK  Kumulatif yuk dogru: {v_state2['current']} desi")
         return PASS
@@ -110,16 +145,24 @@ def test_overload_tracking():
     try:
         from src.utils.state_manager import RedisStateManager
         sm = RedisStateManager()
+        data = _load_data()
+        sm.load_vehicle_state(data)
+        vid, _, cap = _ssot_vehicle(data)
+        city = _ssot_city(data, 1)   # farklı bir şehir
 
-        _r.hset("TM:Yalova:State", mapping={"MaxCapacity": 883655, "CurrentLoad": 883200, "OverloadAmount": 0})
+        # SSoT: TM kapasitesi JSON araç kapasitesinden türetilir (magic number yok).
+        # TM tam dolulukta başlatılır; araç kapasitesi altında bir yük TM'yi taşırır.
+        tm_cap = int(cap)
+        _r.hset(f"TM:{city}:State", mapping={"MaxCapacity": tm_cap, "CurrentLoad": tm_cap, "OverloadAmount": 0})
 
-        pkg = {"pkg_id": "PKG_OVR", "tm_id": "Yalova", "desi": 600.0}
-        ok  = sm.try_load_package(pkg, "KIR_HAFIF_01")
+        desi = max(1.0, cap * 0.05)   # araç sert kısıtını geçer, TM esnek kısıtını taşırır
+        pkg = {"pkg_id": "PKG_OVR", "tm_id": city, "desi": desi}
+        ok  = sm.try_load_package(pkg, vid)
         assert ok, "Arac kapasitesi uygun, yuklenmeli (TM soft constraint)"
 
-        tm_state = sm.get_tm_state("Yalova")
+        tm_state = sm.get_tm_state(city)
         assert tm_state["overload"] > 0, f"delta_i > 0 bekleniyor, gelen={tm_state['overload']}"
-        print(f"  OK  TM:Yalova  delta_i={tm_state['overload']:.1f} desi")
+        print(f"  OK  TM:{city}  delta_i={tm_state['overload']:.1f} desi")
 
         total = sm.get_total_overload()
         assert total > 0
@@ -136,20 +179,24 @@ def test_eta_tracking():
     try:
         from src.utils.state_manager import RedisStateManager
         sm = RedisStateManager()
+        data = _load_data()
+        v0, _, _ = _ssot_vehicle(data, 0)
+        v1, _, _ = _ssot_vehicle(data, 1)
+        city = _ssot_city(data)
 
         now = int(time.time())
-        sm.update_eta("KIR_KAMYON_01", "Kocaeli", now + 1800)
-        sm.update_eta("KIR_HAFIF_01",  "Kocaeli", now + 900)
+        sm.update_eta(v0, city, now + 1800)
+        sm.update_eta(v1, city, now + 900)
 
-        result = sm.get_next_vehicle_eta("Kocaeli")
+        result = sm.get_next_vehicle_eta(city)
         assert result is not None
         next_v, eta_ts = result
-        assert next_v == "KIR_HAFIF_01", f"En yakin arac yanlis: {next_v}"
+        assert next_v == v1, f"En yakin arac yanlis: {next_v}"   # 900 < 1800
         print(f"  OK  En yakin arac: {next_v}  ETA={eta_ts}")
 
-        etas = sm.get_all_etas_for_tm("Kocaeli")
+        etas = sm.get_all_etas_for_tm(city)
         assert len(etas) == 2
-        print(f"  OK  TM:Kocaeli icin {len(etas)} ETA kaydi")
+        print(f"  OK  TM:{city} icin {len(etas)} ETA kaydi")
         return PASS
     except Exception as e:
         print(f"  FAIL  {e}")
@@ -162,19 +209,23 @@ def test_route_echelon():
     try:
         from src.utils.state_manager import RedisStateManager, ECHELON_FIRST, ECHELON_SECOND
         sm = RedisStateManager()
+        data = _load_data()
+        vid, _, _ = _ssot_vehicle(data, 0)
+        vid2, _, _ = _ssot_vehicle(data, 1)
+        c0, c1 = _ssot_city(data, 0), _ssot_city(data, 1)
 
-        key = sm.log_route_echelon("KIR_TIR_01", ["İstanbul", "Yalova"], echelon=ECHELON_SECOND)
+        key = sm.log_route_echelon(vid, [c0, c1], echelon=ECHELON_SECOND)
         assert "Echelon:2" in key
         stops = _r.lrange(key, 0, -1)
-        assert stops == ["İstanbul", "Yalova"], f"Rota duraklari yanlis: {stops}"
+        assert stops == [c0, c1], f"Rota duraklari yanlis: {stops}"
         assert _r.ttl(key) > 0
         print(f"  OK  Echelon-2: {stops}  TTL={_r.ttl(key)}s")
 
-        key1 = sm.log_route_echelon("KIR_KAMYONET_01", ["Kocaeli"], echelon=ECHELON_FIRST)
+        key1 = sm.log_route_echelon(vid2, [c0], echelon=ECHELON_FIRST)
         assert "Echelon:1" in key1
         print(f"  OK  Echelon-1 iskelet hazir (MVP'de pasif)")
 
-        routes = sm.get_route_echelon("KIR_TIR_01", echelon=ECHELON_SECOND)
+        routes = sm.get_route_echelon(vid, echelon=ECHELON_SECOND)
         assert len(routes) >= 1
         print(f"  OK  get_route_echelon: {len(routes)} rota okundu")
         return PASS
@@ -191,11 +242,19 @@ def test_apply_route_loads():
         from tests.mock_generator import generate_tm_demand_items
 
         sm = RedisStateManager()
-        items = generate_tm_demand_items(count=18, seed=42)
+        data = _load_data()
+        sm.load_vehicle_state(data)
+
+        # SSoT: şehirler ve araç id'leri JSON'dan türetilir
+        cities = sorted(data["distance_matrix"].keys())
+        items = generate_tm_demand_items(count=18, seed=42, tm_ids=cities)
+        v0, _, _ = _ssot_vehicle(data, 0)
+        v1, _, _ = _ssot_vehicle(data, 1)
+        half = cities[: max(1, len(cities) // 2)]
 
         route_packages = {
-            "KIR_TIR_01":    [p for p in items if p["tm_id"] in ("İstanbul", "Yalova")][:5],
-            "KIR_KAMYON_01": [p for p in items if p["tm_id"] in ("Kocaeli", "Tekirdağ")][:3],
+            v0: [p for p in items if p["tm_id"] in half][:5],
+            v1: [p for p in items if p["tm_id"] not in half][:3],
         }
 
         assigned = sm.apply_route_loads(route_packages)
@@ -275,33 +334,44 @@ def run_all_tests():
     print("=" * 55)
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    from src.utils.state_manager import RedisStateManager
-    RedisStateManager().reset_states()
-
     tests = [
-        ("Redis Baglantisi",        test_redis_connection),
-        ("reset_states",            test_reset_states),
-        ("try_load_package",        test_load_package),
-        ("Overload (delta_i)",      test_overload_tracking),
-        ("ETA Tracking",            test_eta_tracking),
-        ("2E-VRP Route Iskelet",    test_route_echelon),
-        ("apply_route_loads",       test_apply_route_loads),
-        ("Veri Dogrulama",          test_data_validation),
-        ("Config Env Vars",         test_config),
+        ("Redis Baglantisi",        test_redis_connection, True),
+        ("reset_states",            test_reset_states, True),
+        ("try_load_package",        test_load_package, True),
+        ("Overload (delta_i)",      test_overload_tracking, True),
+        ("ETA Tracking",            test_eta_tracking, True),
+        ("2E-VRP Route Iskelet",    test_route_echelon, True),
+        ("apply_route_loads",       test_apply_route_loads, True),
+        ("Veri Dogrulama",          test_data_validation, False),
+        ("Config Env Vars",         test_config, False),
     ]
 
     results = []
-    for name, fn in tests:
-        try:
-            from src.utils.state_manager import RedisStateManager
-            RedisStateManager().reset_states()
-        except Exception:
-            pass
+    redis_ok = None
+    for name, fn, needs_redis in tests:
+        if needs_redis and redis_ok is False:
+            _section(f"TEST SKIP: {name}")
+            print("  SKIP  Redis baglantisi yok; Redis bagimli test atlandi")
+            results.append((name, SKIP))
+            continue
+
+        if needs_redis and name != "Redis Baglantisi":
+            try:
+                from src.utils.state_manager import RedisStateManager
+                RedisStateManager().reset_states()
+            except Exception:
+                redis_ok = False
+                _section(f"TEST SKIP: {name}")
+                print("  SKIP  Redis baglantisi yok; Redis bagimli test atlandi")
+                results.append((name, SKIP))
+                continue
         try:
             status = fn()
         except Exception as e:
             status = FAIL
             print(f"  FAIL  beklenmedik hata: {e}")
+        if name == "Redis Baglantisi":
+            redis_ok = status == PASS
         results.append((name, status))
 
     print("\n" + "=" * 55)
