@@ -197,6 +197,19 @@ def test_eta_tracking():
         etas = sm.get_all_etas_for_tm(city)
         assert len(etas) == 2
         print(f"  OK  TM:{city} icin {len(etas)} ETA kaydi")
+
+        # clear_vehicle_eta: zombi temizligi (#55.2) — v0 ikinci bir TM'ye de
+        # ulasiyor; teslim tamamlaninca her iki TM ZSET'inden de silinmeli.
+        city2 = _ssot_city(data, 1)
+        sm.update_eta(v0, city2, now + 600)
+        sm.clear_vehicle_eta(v0)
+        ids_city  = [v for v, _ in sm.get_all_etas_for_tm(city)]
+        ids_city2 = [v for v, _ in sm.get_all_etas_for_tm(city2)]
+        assert v0 not in ids_city,  f"{v0} TM:{city} ETA'sindan silinmeliydi"
+        assert v0 not in ids_city2, f"{v0} TM:{city2} ETA'sindan silinmeliydi"
+        assert v1 in ids_city,      f"{v1} korunmaliydi (yanlis silindi)"
+        assert _r.exists(f"ETA:Vehicle:{v0}") == 0, "ETA:Vehicle index temizlenmeliydi"
+        print(f"  OK  clear_vehicle_eta: {v0} tum TM ZSET'lerinden silindi, {v1} korundu")
         return PASS
     except Exception as e:
         print(f"  FAIL  {e}")
