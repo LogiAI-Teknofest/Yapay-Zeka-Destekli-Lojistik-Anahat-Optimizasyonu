@@ -5,7 +5,7 @@ Person D: Sistem Mimarı ve Arayüz Geliştiricisi
 Sayfalar:
 1. Genel Bakış — KPI kartları + maliyet pasta
 2. Rota Haritası — Folium interaktif harita
-3. Transfer Merkezleri — TM kapasite izleme
+3. Şehir Talep Yoğunluğu — şehir bazlı giren/çıkan desi (FIX #34)
 4. Filo Yönetimi — Kiralık/spot araç durumu
 5. Talep Analizi — Zaman serisi grafikleri
 6. Excel Rapor — Çıktı üretim paneli
@@ -77,7 +77,7 @@ with st.sidebar:
 
     page = st.radio(
         "📋 Sayfa",
-        ["Genel Bakış", "Rota Haritası", "Transfer Merkezleri", "Filo Yönetimi", "Talep Analizi", "Excel Rapor"],
+        ["Genel Bakış", "Rota Haritası", "Şehir Talep Yoğunluğu", "Filo Yönetimi", "Talep Analizi", "Excel Rapor"],
         label_visibility="collapsed",
     )
 
@@ -410,19 +410,12 @@ elif page == "Rota Haritası":
         except (TypeError, ValueError):
             continue
 
-        if c.get("tm_var"):
-            color = "green" if c.get("tir_yanasma") else "orange"
-            folium.Marker(
-                location=[lat, lon],
-                popup=f"<b>{c['ad']}</b><br>Kapasite: {c['tm_kapasite']:,} desi<br>Tır: {'✅' if c.get('tir_yanasma') else '❌'}",
-                icon=folium.Icon(color=color, icon="warehouse", prefix="fa"),
-            ).add_to(marker_cluster)
-        else:
-            folium.Marker(
-                location=[lat, lon],
-                popup=f"<b>{c['ad']}</b><br>(Şube - TM yok)",
-                icon=folium.Icon(color="gray", icon="circle", prefix="fa"),
-            ).add_to(marker_cluster)
+        # FIX #34 - Sahte TM kapasite/tir bilgisi kaldirildi; sehir markeri
+        folium.Marker(
+            location=[lat, lon],
+            popup=f"<b>{c['ad']}</b>",
+            icon=folium.Icon(color="blue", icon="warehouse", prefix="fa"),
+        ).add_to(marker_cluster)
 
     # Rota çizgileri
     if result:
@@ -480,39 +473,40 @@ elif page == "Rota Haritası":
 
 
 # ══════════════════════════════════════════════
-#  SAYFA 3: TRANSFER MERKEZLERİ
+#  SAYFA 3: ŞEHİR TALEP YOĞUNLUĞU  (FIX #34)
 # ══════════════════════════════════════════════
 
-elif page == "Transfer Merkezleri":
-    st.header("🏭 Transfer Merkezi İzleme")
+elif page == "Şehir Talep Yoğunluğu":
+    st.header("🏙️ Şehir Bazlı Talep Yoğunluğu")
+    st.caption(
+        "MVP/Dataset A'da transfer merkezi kapasite kısıtı yoktur (şartname). "
+        "Aşağıda seçili tarih için gerçek talep verisinden türetilen "
+        "şehre giren / çıkan desi gösterilir."
+    )
 
     tarih_str = planlama_tarihi.strftime("%Y-%m-%d")
     tm_data = get_tm_status(tarih_str)
 
     if tm_data:
+        df_tm = pd.DataFrame(tm_data).sort_values("toplam_desi", ascending=False)
+
         cols = st.columns(min(len(tm_data), 3))
-        for i, tm in enumerate(tm_data):
+        for i, tm in enumerate(df_tm.to_dict("records")):
             with cols[i % 3]:
-                usage_pct = (tm["yuk"] / tm["kapasite"] * 100) if tm["kapasite"] > 0 else 0
-                color = "🟢" if usage_pct < 70 else "🟡" if usage_pct < 90 else "🔴"
-                st.subheader(f"{color} {tm['tm_ad']}")
-                st.metric("Kapasite", f"{tm['kapasite']:,} desi")
-                st.metric("Güncel Yük", f"{tm['yuk']:,} desi")
-                st.progress(min(usage_pct / 100, 1.0))
-                st.caption(f"Doluluk: %{usage_pct:.1f}")
-                if tm["asim"] > 0:
-                    st.error(f"⚠️ Aşım: {tm['asim']:,} desi | Ceza: ₺{tm['asim_maliyet']:,.0f}")
+                st.subheader(f"📦 {tm['sehir_ad']}")
+                st.metric("Giren (varış)", f"{tm['giren_desi']:,} desi")
+                st.metric("Çıkan (kaynak)", f"{tm['cikan_desi']:,} desi")
+                st.caption(f"Toplam akış: {tm['toplam_desi']:,} desi")
 
         st.divider()
-        st.subheader("Kapasite Karşılaştırması")
-        df_tm = pd.DataFrame(tm_data)
+        st.subheader("Şehir Bazlı Giren / Çıkan Karşılaştırması")
         fig_tm = go.Figure()
-        fig_tm.add_trace(go.Bar(name="Kapasite", x=df_tm["tm_ad"], y=df_tm["kapasite"], marker_color="lightblue"))
-        fig_tm.add_trace(go.Bar(name="Yük", x=df_tm["tm_ad"], y=df_tm["yuk"], marker_color="coral"))
+        fig_tm.add_trace(go.Bar(name="Giren", x=df_tm["sehir_ad"], y=df_tm["giren_desi"], marker_color="lightblue"))
+        fig_tm.add_trace(go.Bar(name="Çıkan", x=df_tm["sehir_ad"], y=df_tm["cikan_desi"], marker_color="coral"))
         fig_tm.update_layout(barmode="group", height=400)
         st.plotly_chart(fig_tm, use_container_width=True)
     else:
-        st.info("Transfer merkezi verisi alınamadı.")
+        st.info("Seçili tarih için talep verisi bulunamadı.")
 
 
 # ══════════════════════════════════════════════
@@ -605,7 +599,12 @@ elif page == "Talep Analizi":
             st.plotly_chart(fig_city, use_container_width=True)
 
         st.subheader("Haftalık Desen")
-        df_demand["hafta_gunu"] = df_demand["gun"].apply(lambda x: ((x - 1) % 7))
+        # FIX #36 - Gün adı sıra numarasından değil gerçek takvim tarihinden türetilir
+        # (gun%7 takvim günüyle uyuşmuyordu; örn. 2026-01-01 Perşembe).
+        import datetime as _dt
+        df_demand["hafta_gunu"] = df_demand["tarih"].apply(
+            lambda t: _dt.date.fromisoformat(t).weekday()
+        )
         day_names = {0: "Pzt", 1: "Sal", 2: "Çar", 3: "Per", 4: "Cum", 5: "Cmt", 6: "Paz"}
         df_demand["gun_ad"] = df_demand["hafta_gunu"].map(day_names)
         weekly = df_demand.groupby("gun_ad")["talep_desi"].mean().reindex(

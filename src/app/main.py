@@ -80,21 +80,41 @@ DATA_DIR = os.environ.get("DATA_DIR", os.path.join(_PROJECT_ROOT, "data", "raw")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(_PROJECT_ROOT, "data", "processed"))
 INPUT_JSON = os.environ.get("INPUT_JSON", os.path.join(DATA_DIR, "logiai_mvp_input.json"))
 
-# /api/tm-status icin heuristik sabitler (DEMO).
-# UYARI: Bu degerler gercek veri sozlesmesinden gelmiyor; transfer merkezi
-# kapasitesi (E_i) ve elleclme ceza katsayisi (lambda) data setine eklendiginde
-# buradaki heuristik kaldirilmalidir. Bkz. ACILACAK_GITHUB_ISSUELARI.md.
-_TM_CAPACITY_FACTOR = 1.5          # kapasite ~= gozlemlenen max gunluk akis * 1.5
-_TM_OVERLOAD_PENALTY_PER_DESI = 8.0  # asim cezasi (TL/desi)
+# FIX #34 - TM kapasite/asim/ceza heuristikleri kaldirildi.
+# Sartname (MVP/Dataset A): "Transfer merkezi kisiti yoktur" ve "sinirsiz
+# alaniniz oldugunu varsayabilirsiniz." Optimizasyon motoru TM kapasitesini
+# kullanmiyor; bu yuzden /api/tm-status artik yalnizca gercek daily_demand'den
+# turetilen sehir bazli talep yogunlugunu (giren/cikan desi) doner.
 
 # --------------------------------------------------
-#  FIX #9 & #36 - load_input uygulama-seviye lru_cache
+#  FIX #9 & #39 - load_input mtime-duyarli cache
 # --------------------------------------------------
+# FIX #39 - Dosya mtime'i cache anahtarinin parcasidir; data/raw volume mount
+# edildiginden JSON guncellenince mtime degisir, yeni anahtar = cache miss =
+# otomatik yeniden okuma. API restart gerekmez. Ayni mtime anahtari tum tureyen
+# cache'lerde (_build_demand_index, _load_city_coords, _fleet_skeleton, _tm_density)
+# kullanildigindan girdi degisince hepsi birlikte tazelenir (FIX #41 ile uyumlu).
 
-@lru_cache(maxsize=1)
-def load_input(path: str) -> dict:
-    """JSON'u bir kez diskten okur; sonraki cagrlarda cache'ten doner."""
+def _path_mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _input_mtime() -> float:
+    """INPUT_JSON'un guncel mtime'i - tureyen cache'lerin tazeleme anahtari."""
+    return _path_mtime(INPUT_JSON)
+
+
+@lru_cache(maxsize=2)
+def _load_input_cached(path: str, mtime: float) -> dict:
     return _load_input_raw(path)
+
+
+def load_input(path: str) -> dict:
+    """JSON'u diskten okur; dosya degismedikce cache'ten doner (mtime anahtarli)."""
+    return _load_input_cached(path, _path_mtime(path))
 
 
 # --------------------------------------------------
@@ -177,15 +197,15 @@ class OptimizeResponse(BaseModel):
     calisma_suresi_sn: float
 
 
-class TMDurum(BaseModel):
+# FIX #34 - Sahte kapasite/asim/ceza yerine gercek talep yogunlugu modeli
+class SehirTalepYogunlugu(BaseModel):
     model_config = ConfigDict(strict=False)
 
-    tm_id: str
-    tm_ad: str
-    kapasite: int
-    yuk: int
-    asim: int
-    asim_maliyet: float
+    sehir_id: str
+    sehir_ad: str
+    giren_desi: int   # sehre gelen toplam desi (varis)
+    cikan_desi: int   # sehirden cikan toplam desi (kaynak)
+    toplam_desi: int  # giren + cikan
 
 
 class FleetVehicle(BaseModel):
@@ -207,13 +227,8 @@ class FleetVehicle(BaseModel):
 # Koordinatlar artik logiai_mvp_input.json["city_coords"] anahtarindan okunur.
 # Format: {"Istanbul": {"lat": 41.01, "lon": 28.97}, ...}
 
-@lru_cache(maxsize=1)
-def _load_city_coords() -> dict[str, dict]:
-    """
-    city_coords'u logiai_mvp_input.json'dan okur.
-    JSON'da "city_coords" anahtari yoksa bos dict doner (koordinatsiz sehirler
-    haritada varsayilan konuma yerlesir).
-    """
+@lru_cache(maxsize=2)
+def _load_city_coords_cached(mtime: float) -> dict[str, dict]:
     try:
         data = load_input(INPUT_JSON)
         return data.get("city_coords", {})
@@ -222,14 +237,22 @@ def _load_city_coords() -> dict[str, dict]:
         return {}
 
 
+def _load_city_coords() -> dict[str, dict]:
+    """
+    city_coords'u logiai_mvp_input.json'dan okur (FIX #39 - mtime anahtarli).
+    JSON'da "city_coords" anahtari yoksa bos dict doner.
+    """
+    return _load_city_coords_cached(_input_mtime())
+
+
 # FIX #1 - int(float(desi)) -> float round(2)
 # FIX #21 - dict index: tarih -> list[row] ile O(1) erisim
 
-@lru_cache(maxsize=1)
-def _build_demand_index() -> dict[str, list[dict]]:
+@lru_cache(maxsize=2)
+def _build_demand_index_cached(mtime: float) -> dict[str, list[dict]]:
     """
     daily_demand'i {tarih: [row, ...]} formatinda indeksler.
-    Disk I/O bir kez yapilir (lru_cache), filtreler O(1) dict lookup.
+    FIX #39 - mtime anahtarli; girdi degisince yeniden kurulur.
     """
     data = load_input(INPUT_JSON)
     daily_demand = data.get("daily_demand", {})
@@ -250,6 +273,11 @@ def _build_demand_index() -> dict[str, list[dict]]:
                     })
         index[tarih] = rows
     return index
+
+
+def _build_demand_index() -> dict[str, list[dict]]:
+    """FIX #39 - mtime anahtarli demand index (girdi degisince tazelenir)."""
+    return _build_demand_index_cached(_input_mtime())
 
 
 def load_demand() -> list[dict]:
@@ -388,11 +416,31 @@ def predict(
     return {"tarih": tarih, "tahminler": predictions}
 
 
+# FIX #41 - Statik filo iskeleti (rental_routes + cost_matrix taramasi) mtime
+# anahtariyla cache'lenir; her istekte yeniden taranmaz. Tarihe/job'a bagli
+# doluluk_pct ise runtime'da uzerine bindirilir (job verisi cache'lenmez).
+@lru_cache(maxsize=2)
+def _fleet_skeleton(mtime: float) -> tuple[dict, ...]:
+    data = load_input(INPUT_JSON)
+    rows = []
+    for route_key, vehicles in data.get("rental_routes", {}).items():
+        origin, dest = route_key.split("_", 1)
+        for v in vehicles:
+            vtype = v.get("vehicle_type", "Tir")
+            cost_row = data.get("cost_matrix", {}).get(origin, {}).get(dest, {}).get(vtype, {})
+            sabit = float(cost_row.get("kiralik", cost_row.get("kiralik", 0)))
+            rows.append({
+                "arac_id": v["id"],
+                "tip": vtype,
+                "sabit_gunluk": sabit,
+                "rota": f"{origin}->{dest}",
+            })
+    return tuple(rows)
+
+
 @app.get("/api/fleet", response_model=list[FleetVehicle])
 def fleet_status(tarih: Optional[str] = Query(None)):
-    """Kiralik filo durum raporu."""
-    data = load_input(INPUT_JSON)
-
+    """Kiralik filo durum raporu. FIX #41 - iskelet cache'li, doluluk runtime."""
     utilisation_map: dict[str, float] = {}
     if tarih:
         job = _get_job_for_date(tarih)
@@ -404,72 +452,75 @@ def fleet_status(tarih: Optional[str] = Query(None)):
                 )
 
     result = []
-    for route_key, vehicles in data.get("rental_routes", {}).items():
-        origin, dest = route_key.split("_", 1)
-        for v in vehicles:
-            vid = v["id"]
-            vtype = v.get("vehicle_type", "Tir")
-            cost_row = data.get("cost_matrix", {}).get(origin, {}).get(dest, {}).get(vtype, {})
-            sabit = float(cost_row.get("kiralik", cost_row.get("kiralik", 0)))
-            result.append(FleetVehicle(
-                arac_id=vid,
-                tip=vtype,
-                sabit_gunluk=sabit,
-                aktif=True,
-                rota=f"{origin}->{dest}",
-                doluluk_pct=round(utilisation_map.get(vid, 0.0) * 100, 1),
-            ))
-    return result
-
-
-@app.get("/api/tm-status", response_model=list[TMDurum])
-def tm_status(tarih: Optional[str] = Query(None)):
-    """Transfer merkezi kapasite izleme - logiai_mvp_input.json'dan turetilir."""
-    data = load_input(INPUT_JSON)
-    daily_demand = data.get("daily_demand", {})
-
-    # FIX #31 - UTC-aware datetime
-    target_date = tarih or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-
-    city_max_flow: dict[str, float] = {}
-    for date, origins in daily_demand.items():
-        day_flow: dict[str, float] = {}
-        for origin, dests in origins.items():
-            for dest, desi in dests.items():
-                day_flow[origin] = day_flow.get(origin, 0.0) + float(desi)
-                day_flow[dest]   = day_flow.get(dest,   0.0) + float(desi)
-        for city, flow in day_flow.items():
-            if flow > city_max_flow.get(city, 0.0):
-                city_max_flow[city] = flow
-
-    date_flow: dict[str, float] = {}
-    for origin, dests in daily_demand.get(target_date, {}).items():
-        for dest, desi in dests.items():
-            date_flow[origin] = date_flow.get(origin, 0.0) + float(desi)
-            date_flow[dest]   = date_flow.get(dest,   0.0) + float(desi)
-
-    result = []
-    for city in sorted(city_max_flow.keys()):
-        # DEMO heuristik - bkz. modul basindaki _TM_* sabitleri ve issue notu
-        kapasite = int(city_max_flow[city] * _TM_CAPACITY_FACTOR)
-        yuk      = int(date_flow.get(city, 0.0))
-        asim     = max(0, yuk - kapasite)
-        result.append(TMDurum(
-            tm_id=city[:4].upper()
-                .replace("I", "I").replace("S", "S").replace("C", "C")
-                .replace("G", "G").replace("U", "U").replace("O", "O"),
-            tm_ad=city,
-            kapasite=kapasite,
-            yuk=yuk,
-            asim=asim,
-            asim_maliyet=round(asim * _TM_OVERLOAD_PENALTY_PER_DESI, 2),
+    for row in _fleet_skeleton(_input_mtime()):
+        vid = row["arac_id"]
+        result.append(FleetVehicle(
+            arac_id=vid,
+            tip=row["tip"],
+            sabit_gunluk=row["sabit_gunluk"],
+            aktif=True,
+            rota=row["rota"],
+            doluluk_pct=round(utilisation_map.get(vid, 0.0) * 100, 1),
         ))
     return result
 
 
+# FIX #41 - Sonuc (mtime, tarih) anahtariyla cache'lenir; her istekte yeniden
+# hesaplanmaz, girdi degisince otomatik tazelenir.
+@lru_cache(maxsize=256)
+def _tm_density(mtime: float, target_date: str) -> list[SehirTalepYogunlugu]:
+    data = load_input(INPUT_JSON)
+    daily_demand = data.get("daily_demand", {})
+
+    giren: dict[str, float] = {}
+    cikan: dict[str, float] = {}
+    for origin, dests in daily_demand.get(target_date, {}).items():
+        for dest, desi in dests.items():
+            cikan[origin] = cikan.get(origin, 0.0) + float(desi)
+            giren[dest]   = giren.get(dest,   0.0) + float(desi)
+
+    result = []
+    for city in sorted(set(giren) | set(cikan)):
+        g = int(giren.get(city, 0.0))
+        c = int(cikan.get(city, 0.0))
+        result.append(SehirTalepYogunlugu(
+            sehir_id=city[:4].upper(),
+            sehir_ad=city,
+            giren_desi=g,
+            cikan_desi=c,
+            toplam_desi=g + c,
+        ))
+    return result
+
+
+@app.get("/api/tm-status", response_model=list[SehirTalepYogunlugu])
+def tm_status(tarih: Optional[str] = Query(None)):
+    """
+    FIX #34 - Sehir bazli talep yogunlugu (gercek daily_demand'den).
+    MVP/Dataset A'da TM kapasite kisiti yoktur (sartname); bu yuzden uydurma
+    kapasite/asim/ceza yerine secili tarih icin sehre giren (varis) ve
+    sehirden cikan (kaynak) gercek desi gosterilir.
+    FIX #41 - Sonuc cache'lenir.
+    """
+    # FIX #31 - UTC-aware datetime
+    target_date = tarih or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    return _tm_density(_input_mtime(), target_date)
+
+
 @app.get("/api/excel")
-def generate_excel(tarih: str = Query(...)):
-    """Optimizasyon sonuclarini Excel olarak olustur"""
+def generate_excel(
+    tarih: str = Query(...),
+    time_limit: int = Query(120, ge=1, description="Tamamlanmis job yoksa sync optimizasyon zaman siniri (sn)"),
+):
+    """
+    FIX #35 - Excel ciktisi optimizasyon SONUCUNDAN uretilir (kiralik + spot
+    atamalar). Ana sayfa kolonlari jurinin example_solution.xlsx formatiyla
+    ayni: Tarih, Arac Tipi, Cikis TM, Varis TM, Atanan Desi, Maliyet.
+
+    Veri kaynagi: once o tarih icin tamamlanmis async job sonucu kullanilir;
+    yoksa boru hatti senkron calistirilir (fallback her kosulda gecerli plan
+    garanti eder).
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     from fastapi.responses import FileResponse
@@ -479,48 +530,69 @@ def generate_excel(tarih: str = Query(...)):
     if not date_demands:
         raise HTTPException(404, f"{tarih} icin veri yok")
 
+    mvp_data = load_input(INPUT_JSON)
+
+    # FIX #35 - Optimizasyon sonucunu al: once tamamlanmis job, yoksa sync calistir
+    result = None
+    job = _get_job_for_date(tarih)
+    if job and job.get("status") == "COMPLETED":
+        result = job.get("result")
+    if result is None:
+        result = _run_pipeline(mvp_data, tarih, time_limit_sec=time_limit)
+
+    rental_assignments = result.get("rental_assignments", [])
+    spot_assignments   = result.get("spot_assignments", [])
+
+    # FIX #35 - rental atamalarinda vehicle_type yok; rental_routes'tan id->tip eslemesi
+    id_to_vtype: dict[str, str] = {}
+    for vehicles in mvp_data.get("rental_routes", {}).values():
+        for v in vehicles:
+            id_to_vtype[v["id"]] = v.get("vehicle_type", "Tir")
+
     wb = Workbook()
 
-    # -- Sayfa 1: Rota Plani --
+    # -- Sayfa 1: Cozum (juri formati) --
     ws1 = wb.active
-    ws1.title = "Rota Plani"
+    ws1.title = "Cozum"
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
 
-    headers1 = ["Arac ID", "Tip", "Rota", "Kaynak", "Hedef", "Yuk (desi)", "Mesafe (km)", "Sure (saat)", "Maliyet (TL)"]
+    # FIX #35 - example_solution.xlsx kolon yapisi
+    headers1 = ["Tarih", "Arac Tipi", "Cikis TM", "Varis TM", "Atanan Desi", "Maliyet"]
     for col, h in enumerate(headers1, 1):
         cell = ws1.cell(row=1, column=col, value=h)
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center")
 
-    mvp_data    = load_input(INPUT_JSON)
-    dist_matrix = load_distance_matrix()
-    time_matrix = load_travel_time_matrix()
     row_idx = 2
-    total_fixed = 0
-    for route_key, vehicles in mvp_data.get("rental_routes", {}).items():
-        src, dst = route_key.split("_", 1)
-        demand_val = next(
-            (int(float(r["talep_desi"])) for r in date_demands
-             if r["gonderen_id"] == src and r["alan_id"] == dst), 0
-        )
-        for v in vehicles:
-            vtype = v.get("vehicle_type", "Tir")
-            cap   = float(v.get("capacity_desi", 0))
-            cost_row = mvp_data.get("cost_matrix", {}).get(src, {}).get(dst, {}).get(vtype, {})
-            sabit = float(cost_row.get("kiralik", cost_row.get("kiralik", 0)))
-            total_fixed += sabit
-            ws1.cell(row=row_idx, column=1, value=v["id"])
-            ws1.cell(row=row_idx, column=2, value="Kiralik " + vtype)
-            ws1.cell(row=row_idx, column=3, value=f"{src}-{dst}")
-            ws1.cell(row=row_idx, column=4, value=src)
-            ws1.cell(row=row_idx, column=5, value=dst)
-            ws1.cell(row=row_idx, column=6, value=min(demand_val, cap))
-            ws1.cell(row=row_idx, column=7, value=dist_matrix.get(src, {}).get(dst, 0))
-            ws1.cell(row=row_idx, column=8, value=time_matrix.get(src, {}).get(dst, 0))
-            ws1.cell(row=row_idx, column=9, value=sabit)
-            row_idx += 1
+    total_rental = 0.0
+    total_spot   = 0.0
+
+    # Kiralik atamalar
+    for a in rental_assignments:
+        vtype = id_to_vtype.get(a.get("vehicle_id", ""), "Tir")
+        cost  = float(a.get("cost", 0.0))
+        total_rental += cost
+        ws1.cell(row=row_idx, column=1, value=tarih)
+        ws1.cell(row=row_idx, column=2, value=f"Kiralik {vtype}")
+        ws1.cell(row=row_idx, column=3, value=a.get("origin"))
+        ws1.cell(row=row_idx, column=4, value=a.get("destination"))
+        ws1.cell(row=row_idx, column=5, value=round(float(a.get("assigned_desi", 0.0)), 2))
+        ws1.cell(row=row_idx, column=6, value=round(cost, 2))
+        row_idx += 1
+
+    # Spot atamalar (FIX #35 - onceki surumde tamamen eksikti)
+    for a in spot_assignments:
+        cost = float(a.get("cost", 0.0))
+        total_spot += cost
+        ws1.cell(row=row_idx, column=1, value=tarih)
+        ws1.cell(row=row_idx, column=2, value=f"Spot {a.get('vehicle_type', '')}")
+        ws1.cell(row=row_idx, column=3, value=a.get("origin"))
+        ws1.cell(row=row_idx, column=4, value=a.get("destination"))
+        ws1.cell(row=row_idx, column=5, value=round(float(a.get("assigned_desi", 0.0)), 2))
+        ws1.cell(row=row_idx, column=6, value=round(cost, 2))
+        row_idx += 1
 
     # -- Sayfa 2: Talep Ozeti --
     ws2 = wb.create_sheet("Talep Ozeti")
@@ -536,7 +608,7 @@ def generate_excel(tarih: str = Query(...)):
         ws2.cell(row=i, column=3, value=r["alan_id"])
         ws2.cell(row=i, column=4, value=float(r["talep_desi"]))  # FIX #1
 
-    # -- Sayfa 3: Maliyet Analizi --
+    # -- Sayfa 3: Maliyet Analizi (FIX #35 - gercek spot maliyeti) --
     ws3 = wb.create_sheet("Maliyet Analizi")
     headers3 = ["Kalem", "Tutar (TL)"]
     for col, h in enumerate(headers3, 1):
@@ -545,11 +617,11 @@ def generate_excel(tarih: str = Query(...)):
         cell.fill = header_fill
 
     ws3.cell(row=2, column=1, value="Kiralik Filo Sabit")
-    ws3.cell(row=2, column=2, value=total_fixed)
+    ws3.cell(row=2, column=2, value=round(total_rental, 2))
     ws3.cell(row=3, column=1, value="Spot Arac Degisken")
-    ws3.cell(row=3, column=2, value="- (optimizasyon sonrasi)")
+    ws3.cell(row=3, column=2, value=round(total_spot, 2))
     ws3.cell(row=4, column=1, value="TOPLAM")
-    ws3.cell(row=4, column=2, value=total_fixed)
+    ws3.cell(row=4, column=2, value=round(total_rental + total_spot, 2))
     ws3.cell(row=4, column=1).font = Font(bold=True)
 
     output_path = os.path.join(OUTPUT_DIR, f"rapor_{tarih}.xlsx")
@@ -565,7 +637,11 @@ def generate_excel(tarih: str = Query(...)):
 
 @app.get("/api/cities")
 def list_cities():
-    """Tum sehir ve TM bilgisi - koordinatlar logiai_mvp_input.json'dan okunur."""
+    """
+    Sehir listesi ve koordinatlari (logiai_mvp_input.json'dan).
+    FIX #34 - Uydurma tm_var/tm_kapasite/tir_yanasma sabitleri kaldirildi;
+    MVP'de TM kapasite kisiti yoktur, bu alanlar veriye dayanmiyordu.
+    """
     # FIX #4 - Excel bagimliligi kaldirildi
     data = load_input(INPUT_JSON)
     coords_map = _load_city_coords()
@@ -573,13 +649,10 @@ def list_cities():
     for city_name in sorted(data["distance_matrix"].keys()):
         coords = coords_map.get(city_name, {"lat": 39.0, "lon": 35.0})
         cities.append({
-            "id":          city_name,
-            "ad":          city_name,
-            "lat":         coords["lat"],
-            "lon":         coords["lon"],
-            "tm_var":      True,
-            "tm_kapasite": 500000,
-            "tir_yanasma": True,
+            "id":   city_name,
+            "ad":   city_name,
+            "lat":  coords["lat"],
+            "lon":  coords["lon"],
         })
     return {"sehirler": cities}
 

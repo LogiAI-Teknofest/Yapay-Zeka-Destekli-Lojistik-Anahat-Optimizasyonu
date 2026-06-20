@@ -110,6 +110,9 @@ def set_completed(job_id: str, result: dict) -> None:
     FIX #13 — Tarih bazlı indeks artık eski job'ı silmek yerine RPUSH ile
     listenin sonuna ekleniyor. En son tamamlanan job her zaman listenin sonu.
     FIX #41 — RedisError koruması eklendi.
+    FIX #40 — RPUSH sonrası LTRIM ile liste yalnızca son job_id'yi tutar;
+    aynı tarih tekrar optimize edildiğinde liste sınırsız büyümez
+    (get_job_for_date zaten yalnızca son elemanı kullanıyor).
     """
     try:
         _patch(job_id, {"status": "COMPLETED", "finished_at": _now(), "result": result})
@@ -117,8 +120,9 @@ def set_completed(job_id: str, result: dict) -> None:
         if date:
             r = _client()
             list_key = f"{_DATE_PREFIX}{date}"
-            # RPUSH: listeye ekle (override yok), ardından TTL tazele
+            # RPUSH: listeye ekle (override yok), ardından sadece son elemanı tut
             r.rpush(list_key, job_id)
+            r.ltrim(list_key, -1, -1)  # FIX #40 — yalnızca en güncel job_id kalsın
             r.expire(list_key, _JOB_TTL)
     except redis.RedisError as exc:
         logger.error("Redis error in set_completed: %s", exc)
