@@ -231,6 +231,42 @@ def test_kiralik_varyant():
         os.unlink(path)
 
 
+# ── Senaryo 4: Geçerli Veri Korunmalı (kayıpsızlık + ekstra anahtar) ─────────
+
+def test_data_preservation():
+    """Pozitif testler: sağlam veri OVER-sanitize edilip kaybolmamalı.
+    Mevcut senaryolar 'bozuk veri atılıyor mu'yu test eder; bu senaryo
+    'geçerli veri eksiksiz korunuyor mu'yu garanti eder (regresyon kalkanı)."""
+    from src.utils.data_loader import load_input
+
+    _header("SENARYO 4: Geçerli Veri Korunmalı (kayıpsızlık + ekstra anahtar)")
+
+    print("\n  [4a] Tamamen geçerli sözleşme → hiçbir kayıt düşmemeli")
+    data = copy.deepcopy(_BASE)
+    path = _write_tmp(data)
+    try:
+        d = load_input(path)
+        assert "B" in d["distance_matrix"].get("A", {}), "geçerli mesafe korunmaliydi"
+        assert "Tır" in d["cost_matrix"]["A"]["B"], "geçerli cost kaydı korunmaliydi"
+        assert len(d["rental_routes"].get("A_B", [])) == 1, "geçerli araç korunmaliydi"
+        assert d["daily_demand"]["2026-05-23"]["A"]["B"] == 500.0, "geçerli talep korunmaliydi"
+        print("  [OK]  Sağlam veri eksiksiz korundu (mesafe+cost+araç+talep)")
+    finally:
+        os.unlink(path)
+
+    print("\n  [4b] Bilinmeyen üst anahtar (city_coords) korunmalı (#30 bağımlılığı)")
+    data = copy.deepcopy(_BASE)
+    data["city_coords"] = {"A": {"lat": 41.0, "lon": 29.0}, "B": {"lat": 40.6, "lon": 29.3}}
+    path = _write_tmp(data)
+    try:
+        d = load_input(path)
+        assert "city_coords" in d, "data_loader bilinmeyen üst anahtarı kırpmamali (app city_coords okuyor)"
+        assert d["city_coords"]["A"]["lat"] == 41.0, "city_coords içeriği bozulmamali"
+        print("  [OK]  city_coords aynen geçirildi (app harita verisi korunur)")
+    finally:
+        os.unlink(path)
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 def run_stress_test():
@@ -243,6 +279,7 @@ def run_stress_test():
         ("Iskelet Bozuk -> raise",          test_iskelet_bozuk),
         ("Bozuk Alt-Veri -> graceful skip", test_graceful_skip),
         ("Kiralik Fiyat Varyantlari",       test_kiralik_varyant),
+        ("Gecerli Veri Korunmali",          test_data_preservation),
     ]
 
     basarili, basarisiz = [], []
