@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import Any
 
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
@@ -533,6 +534,7 @@ class SpotVRPSolver:
 
             routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
 
+
     def _search_params(self) -> pywrapcp.DefaultRoutingSearchParameters:
         """Arama parametrelerini yapılandırır."""
         params = pywrapcp.DefaultRoutingSearchParameters()
@@ -563,6 +565,10 @@ class SpotVRPSolver:
         içerir; bunlar raporlama için anlamsızdır.
         Rota adım adım dolaşılır; yalnızca fiziksel maliyet toplanır:
             fiziksel_maliyet = Σ arc_km_maliyeti + sabit_kontak_bedeli
+
+        Fix-61: Çok duraklı rotalar artık lumped (toplu) değil, her bacak
+        için ayrı SpotAssignment üretilir. Sabit kontak bedeli yalnızca
+        ilk bacağa yazılır; ara bacaklar saf KM maliyetiyle raporlanır.
         """
         if not solution:
             log.warning("OR-Tools çözüm üretemedi; VRP sonucu boş.")
@@ -588,37 +594,57 @@ class SpotVRPSolver:
             if not nodes:
                 continue
 
-            route_path: list[str] = []
-            total_desi             = 0.0
+            # Fix-61: Rota tam düğüm listesini oluştur (depot dahil değil)
+            # Her bacak (node[i] → node[i+1]) ayrı SpotAssignment olarak yazılır.
+            # Sabit kontak bedeli aracın ilk hareketinde bir kez ödenir.
+            fixed_cost_remaining = self._fixed_costs.get(vtype, 0.0)
 
-            # Fix-10: Fiziksel maliyet = sabit kontak bedeli + KM toplamı.
-            # SetFixedCostOfVehicle'da ayarlanan sabit bedel OR-Tools objective'e
-            # eklenir ama biz onu buraya ayrıca dahil ediyoruz.
-            physical_cost = self._fixed_costs.get(vtype, 0.0)
-
-            for n in nodes:
+            # Tek düğümlü rota (A → B): özel durum, direkt atama
+            if len(nodes) == 1:
+                n = nodes[0]
                 o, d, desi = demands[n - 1]
-                total_desi += desi   # Fix-01: ham desi (ölçeksiz) kullan
-                # Fix-10: Yalnızca spot KM maliyeti — disjunction cezası eklenmez
                 c = _safe_spot_cost(self._cost_matrix, o, d, vtype)
-                if c != float("inf"):
-                    physical_cost += c
-                if not route_path:
-                    route_path.append(o)
-                route_path.append(d)
-
-            assignments.append(
-                SpotAssignment(
-                    vehicle_type  = vtype,
-                    origin        = demands[nodes[0] - 1][0],
-                    destination   = demands[nodes[-1] - 1][1],
-                    assigned_desi = total_desi,
-                    capacity_desi = vcap,
-                    cost          = round(physical_cost, 2),
-                    route_path    = tuple(route_path),
-                    source        = "vrp",
+                arc_cost = c if c != float("inf") else 0.0
+                assignments.append(
+                    SpotAssignment(
+                        vehicle_type  = vtype,
+                        origin        = o,
+                        destination   = d,
+                        assigned_desi = desi,
+                        capacity_desi = vcap,
+                        cost          = round(fixed_cost_remaining + arc_cost, 2),
+                        route_path    = (o, d),
+                        source        = "vrp",
+                    )
                 )
-            )
+                continue
+
+            # Fix-61: Çok duraklı rota — ardışık bacaklar halinde tara
+            for i in range(len(nodes) - 1):
+                from_n = nodes[i]
+                to_n   = nodes[i + 1]
+                o, _, _        = demands[from_n - 1]   # kaynak şehir
+                _, d, leg_desi = demands[to_n   - 1]   # hedef şehir + o bacağın talep desisi
+
+                c = _safe_spot_cost(self._cost_matrix, o, d, vtype)
+                arc_cost = c if c != float("inf") else 0.0
+
+                # Sabit kontak bedeli yalnızca ilk bacakta ödenir
+                leg_cost = round(fixed_cost_remaining + arc_cost, 2)
+                fixed_cost_remaining = 0.0   # sonraki bacaklar sabit bedel ödemez
+
+                assignments.append(
+                    SpotAssignment(
+                        vehicle_type  = vtype,
+                        origin        = o,
+                        destination   = d,
+                        assigned_desi = leg_desi,
+                        capacity_desi = vcap,
+                        cost          = leg_cost,
+                        route_path    = (o, d),
+                        source        = "vrp",
+                    )
+                )
 
         log.info("OR-Tools %d spot atama üretti.", len(assignments))
         return assignments
@@ -655,8 +681,10 @@ class SpotVRPSolver:
         Atanmamış düğümleri en ucuz spot araçla doğrudan eşler.
 
         Her düğüm için:
-            1. Desi başına en verimli araç tipini seç.
-            2. Kaç araç gerekiyorsa o kadar SpotAssignment üret.
+            1. Fix-52: Seçilen araç kapasitesinin %10'unun altında kalan
+               kargolar spot araca verilmez; unassigned olarak loglanır.
+            2. Desi başına en verimli araç tipini seç.
+            3. Kaç araç gerekiyorsa o kadar SpotAssignment üret.
         """
         if not unassigned_nodes:
             return []
@@ -688,6 +716,11 @@ class SpotVRPSolver:
 
             for batch_no in range(n_vehicles):
                 batch_desi = min(vcap, desi - batch_no * vcap)
+
+                # Fallback: Bu parça ne kadar küçük olursa olsun (ör. 10 desi), 
+                # şartname gereği "kaba rota" ile atanıp gönderilmelidir. 
+                # Aksi takdirde pipeline tıkanır. Fix-52 burada bilinçli iptal edildi.
+
                 fallback.append(
                     SpotAssignment(
                         vehicle_type  = vtype,
@@ -737,7 +770,8 @@ def run_spot_vrp(
     spill_demand : dict[RouteKey, float]
         Aşama 1'den dönen {(origin, dest): desi} sözlüğü.
     time_limit_sec : int
-        OR-Tools zaman sınırı (saniye); her origin VRP'sine ayrı ayrı uygulanır.
+        OR-Tools zaman sınırı (saniye); toplam bütçe origin sayısına
+        dinamik olarak bölünerek her alt çözücüye aktarılır. (Fix-11)
 
     Returns
     -------
@@ -757,13 +791,25 @@ def run_spot_vrp(
 
     all_assignments: list[SpotAssignment] = []
 
-    for origin, demands in origin_groups.items():
+    # Fix-11: Global başlangıç zamanı — her iterasyonda kalan bütçe
+    # hesaplanarak o anki origin'e adil süre verilir.
+    global_start  = time.monotonic()
+    origins       = list(origin_groups.keys())
+    total_origins = len(origins)
+
+    for i, origin in enumerate(origins):
+        elapsed        = time.monotonic() - global_start
+        remaining_sec  = max(1, time_limit_sec - int(elapsed))
+        remaining_orgs = total_origins - i          # bu + sonraki originler
+        per_origin_sec = max(1, remaining_sec // remaining_orgs)
+
         log.info(
-            "Fix-08: origin=%s  |  izole VRP başlatılıyor (%d talep).",
-            origin, len(demands),
+            "Fix-08+11: origin=%s  |  izole VRP başlatılıyor (%d talep)  "
+            "|  süre_bütçesi=%ds  (kalan=%ds / %d origin).",
+            origin, len(origins[i:i+1]), per_origin_sec, remaining_sec, remaining_orgs,
         )
-        # Her origin için bağımsız solver → bağımsız GC referans deposu
-        solver      = SpotVRPSolver(data, time_limit_sec=time_limit_sec)
+        demands     = origin_groups[origin]
+        solver      = SpotVRPSolver(data, time_limit_sec=per_origin_sec)
         assignments = solver.solve(demands)
         all_assignments.extend(assignments)
 

@@ -22,6 +22,7 @@ Algoritma:
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any
 
@@ -34,6 +35,45 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _FLOAT_ZERO_TOLERANCE: float = 1e-6   # kayan nokta sıfır eşiği
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Özel Hata Sınıfı
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DataContractError(Exception):
+    """
+    Bug-06: Veri sözleşmesi ihlali — cost_matrix'te maliyet eksik veya tutarsız.
+
+    Sessizce 0.0 döndürmek yerine fail-fast yaparak hatalı planlama
+    çıktısının jüriye/API'ye ulaşmasını önler.
+    """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bug-06: Araç Sınıfı Normalize Tablosu
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Preprocessing cost_matrix anahtarlarını kodlu biçimde (TIR, KAM, HAF, KMT)
+# üretmektedir. _infer_vehicle_class display adı (Tır, Kamyon…) döndürüyor
+# olabilir; bu tablo her iki biçimi cost_matrix'teki gerçek anahtara eşler.
+_VCLASS_NORMALIZE: dict[str, str] = {
+    # Preprocessing kodu ürettiği formatlar
+    "TIR":          "TIR",
+    "KAM":          "KAM",
+    "HAF":          "HAF",
+    "KMT":          "KMT",
+    # _infer_vehicle_class'ın ürettiği display adlar
+    "Tır":          "TIR",
+    "Tir":          "TIR",
+    "Kamyon":       "KAM",
+    "KAMYON":       "KAM",
+    "Hafif Kamyon": "HAF",
+    "HAFIF":        "HAF",
+    "Kamyonet":     "KMT",
+    "KAMYONET":     "KMT",
+    "KNET":         "KMT",
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -67,6 +107,50 @@ def _infer_vehicle_class(vehicle_id: str) -> str:
         vehicle_id,
     )
     return "Tır"
+
+
+def _lookup_rental_cost(
+    cost_matrix: dict,
+    origin: str,
+    dest: str,
+    vclass: str,
+) -> float:
+    """
+    Bug-06: dict.get() zinciriyle kiralık maliyeti güvenli okur.
+
+    Davranış:
+        1. vclass hem as-is hem canonical biçimiyle denenir
+           (cost_matrix JSON'ı "TIR" veya "Tır" kullanmış olabilir).
+        2. "kiralik" ve "kiralık" anahtar varyantları denenir
+           (aksan/yazım farklılıkları için).
+        3. Her iki deneme de başarısız olursa DataContractError
+           fırlatılır — 0.0 döndürülmez, sessizce devam edilmez.
+
+    Raises
+    ------
+    DataContractError
+        cost_matrix'te eşleşen giriş bulunamadığında.
+    """
+    canonical = _VCLASS_NORMALIZE.get(vclass, vclass)
+
+    # Sıralı tekil arama: önce orijinal vclass, sonra normalize form
+    for cls_key in dict.fromkeys([vclass, canonical]):
+        prices = (
+            cost_matrix
+            .get(origin, {})
+            .get(dest, {})
+            .get(cls_key, {})
+        )
+        cost = prices.get("kiralik", prices.get("kiralık", None))
+        if cost is not None:
+            return float(cost)
+
+    raise DataContractError(
+        f"Kiralık maliyet eksik: cost_matrix['{origin}']['{dest}']"
+        f"['{canonical}']['kiralik'|'kiralık']. "
+        f"Mevcut anahtarlar: "
+        f"{list(cost_matrix.get(origin, {}).get(dest, {}).keys())}"
+    )
 
 
 def _build_vehicle_pool(
@@ -104,15 +188,8 @@ def _build_vehicle_pool(
             cap = float(vehicle["capacity_desi"])
             vclass = _infer_vehicle_class(vid)
 
-            try:
-                unit_cost = float(cost_matrix[origin][dest][vclass]["kiralik"])
-            except (KeyError, TypeError):
-                log.warning(
-                    "Kiralık maliyet bulunamadı: cost_matrix['%s']['%s']['%s']"
-                    "['kiralik']. Maliyet 0.0 olarak atandı.",
-                    origin, dest, vclass,
-                )
-                unit_cost = 0.0
+            # Bug-06: fail-fast lookup — 0.0 fallback yok
+            unit_cost = _lookup_rental_cost(cost_matrix, origin, dest, vclass)
 
             pool[vid] = {
                 "origin":    origin,
@@ -190,7 +267,10 @@ def run_greedy_assignment(
     """
     cost_matrix   = data["cost_matrix"]
     rental_routes = data["rental_routes"]
-    daily_demand  = data["daily_demand"]
+
+    # Bug-01 (savunmacı): daily_demand mevcut kodda değiştirilmese de,
+    # gelecekteki refactor'lara karşı orijinal veri izole edilir.
+    daily_demand  = copy.deepcopy(data["daily_demand"])
 
     demand_items = _flatten_and_sort_demand(daily_demand, date)
 
@@ -215,8 +295,10 @@ def run_greedy_assignment(
             and info["remaining"] > _FLOAT_ZERO_TOLERANCE
         ]
 
-        # Kalan kapasitesi en çok olan araç önce dolar (bin-packing heuristiği)
-        matching.sort(key=lambda x: x[1]["remaining"], reverse=True)
+        # Bug-02: Küçük araç önce dolar — büyük araçlar büyük talepler için korunur.
+        # Küçükten büyüğe (ascending) sıralama: en küçük kapasiteli araç önce
+        # dener; büyük TIR'lar ancak küçük araçlar dolunca devreye girer.
+        matching.sort(key=lambda x: x[1]["remaining"], reverse=False)
 
         for vid, info in matching:
             if remaining <= _FLOAT_ZERO_TOLERANCE:
@@ -253,8 +335,33 @@ def run_greedy_assignment(
                 origin, dest, remaining,
             )
 
+    # Bug-07: Boşta kalan kiralık araçları faturalandır.
+    # TEKNOFEST şartnamesi: kiralık araç hatta tanımlıysa %0 dolulukta da
+    # günlük ücretini alır. Atama yapılmamış araçlar (assigned <= tolerans)
+    # assigned_desi=0.0 ile listeye eklenir.
+    empty_count = 0
+    for vid, info in vehicle_pool.items():
+        if info["assigned"] <= _FLOAT_ZERO_TOLERANCE:
+            rental_assignments.append(
+                RentalAssignment(
+                    vehicle_id=vid,
+                    origin=info["origin"],
+                    destination=info["dest"],
+                    assigned_desi=0.0,
+                    capacity_desi=info["capacity"],
+                    cost=info["unit_cost"],
+                )
+            )
+            empty_count += 1
+            log.info(
+                "Boş kiralık araç faturalandırıldı  %s → %s  |  araç: %s"
+                "  |  %.2f TL",
+                info["origin"], info["dest"], vid, info["unit_cost"],
+            )
+
     log.info(
-        "Aşama 1 tamamlandı: %d kiralık atama, %d güzergâhta spill.",
-        len(rental_assignments), len(spill_demand),
+        "Aşama 1 tamamlandı: %d kiralık atama (%d boş araç dahil), "
+        "%d güzergâhta spill.",
+        len(rental_assignments), empty_count, len(spill_demand),
     )
     return rental_assignments, spill_demand

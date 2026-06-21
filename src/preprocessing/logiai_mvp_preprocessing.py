@@ -28,7 +28,7 @@ except ImportError:
 
 
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
-OUTPUT_PATH = PROJECT_ROOT / "data" / "raw" / "logiai_mvp_input.json"
+OUTPUT_PATH = PROJECT_ROOT / "data" / "processed" / "logiai_mvp_input.json"
 DEFAULT_TRANSFER_CENTER_CAPACITY_DESI = 10_000_000
 DEFAULT_TIR_ALLOWED = True
 
