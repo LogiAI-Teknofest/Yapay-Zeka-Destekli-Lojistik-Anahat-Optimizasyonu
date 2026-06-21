@@ -628,25 +628,66 @@ elif page == "Excel Rapor":
     st.header("📄 Excel Rapor Üretimi")
 
     tarih_str = planlama_tarihi.strftime("%Y-%m-%d")
+    GUN_SAYISI = 7
+    excel_key = f"excel_{tarih_str}_{GUN_SAYISI}"
+    st.session_state.setdefault("_excel_jobs", {})    # {key: job_id}
+    st.session_state.setdefault("_excel_bytes", {})   # {key: zip bytes}
 
-    st.info(f"{tarih_str} tarihi için Excel raporu oluşturulacak.")
+    st.info(f"{tarih_str} tarihinden itibaren {GUN_SAYISI} günlük teslim paketi (ZIP: 1_ tahmin + 2_ araç planı).")
 
-    # FIX #11 — hata durumunda cache'e girme; raise_for_status ile hata yükseltiliyor
-    # FIX #34 — raise_for_status eklendi
-    @st.cache_data(show_spinner="Rapor sunucudan alınıyor...", ttl=300)
-    def get_excel_data(t: str) -> bytes:
-        r = _session.get(f"{API_BASE}/api/excel", params={"tarih": t}, timeout=30)
-        r.raise_for_status()  # FIX #34 — Hata olursa cache'e girmez
-        return r.content
+    # FIX #77 — Excel artık async job ile üretiliyor; 7 gün × optimizasyon
+    # dakikalar sürebildiğinden senkron istek 30sn timeout'a takılıyordu.
+    # Akış: POST /api/excel/async → /api/jobs/{id} polling → /api/excel/result/{id}.
 
-    try:
-        excel_bytes = get_excel_data(tarih_str)
+    if st.button("🧾 Teslim Paketini Üret (7 gün)", type="primary",
+                 disabled=excel_key in st.session_state["_excel_jobs"]):
+        try:
+            r = _session.post(
+                f"{API_BASE}/api/excel/async",
+                params={"tarih": tarih_str, "gun_sayisi": GUN_SAYISI},
+                timeout=10,
+            )
+            r.raise_for_status()
+            st.session_state["_excel_jobs"][excel_key] = r.json()["job_id"]
+            st.session_state["_excel_bytes"].pop(excel_key, None)
+            st.rerun()
+        except Exception as e:
+            st.error(f"Excel işi başlatılamadı: {e}")
+
+    # Devam eden iş varsa durumu sorgula
+    if excel_key in st.session_state["_excel_jobs"]:
+        job_id = st.session_state["_excel_jobs"][excel_key]
+        try:
+            jr = _session.get(f"{API_BASE}/api/jobs/{job_id}", timeout=10)
+            jr.raise_for_status()
+            status = jr.json().get("status")
+            if status == "COMPLETED":
+                dr = _session.get(f"{API_BASE}/api/excel/result/{job_id}", timeout=30)
+                dr.raise_for_status()
+                st.session_state["_excel_bytes"][excel_key] = dr.content
+                del st.session_state["_excel_jobs"][excel_key]
+                st.rerun()
+            elif status == "FAILED":
+                st.error(f"Excel üretimi başarısız: {jr.json().get('error', '?')}")
+                del st.session_state["_excel_jobs"][excel_key]
+            else:
+                st.info(f"⏳ Teslim paketi üretiliyor (7 gün optimizasyon)... durum: {status}")
+                import time
+                time.sleep(3)
+                st.rerun()
+        except Exception as e:
+            st.warning(f"İş durumu alınamadı, yeniden deneniyor: {e}")
+            import time
+            time.sleep(3)
+            st.rerun()
+
+    # Hazır ZIP varsa indir
+    if excel_key in st.session_state["_excel_bytes"]:
+        st.success("✅ Teslim paketi hazır.")
         st.download_button(
-            label="📥 Raporu İndir",
-            data=excel_bytes,
-            file_name=f"2_Arac_Planlama_Ciktisi_{tarih_str}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            label="📥 Teslim Paketini İndir (ZIP)",
+            data=st.session_state["_excel_bytes"][excel_key],
+            file_name=f"logiai_cikti_{tarih_str}.zip",
+            mime="application/zip",
             type="primary",
         )
-    except Exception as e:  # FIX #27
-        st.error(f"Rapor alınamadı: {e}")
