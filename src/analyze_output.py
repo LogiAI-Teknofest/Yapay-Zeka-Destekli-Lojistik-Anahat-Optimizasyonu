@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 HERE = Path(__file__).parent
-out = json.loads((HERE / "../data/processed/optimization_output.json").read_text(encoding="utf-8"))
+out = json.loads((HERE / "../data/processed/optimization_result.json").read_text(encoding="utf-8"))
 inp = json.loads((HERE / "../data/processed/logiai_mvp_input.json").read_text(encoding="utf-8"))
 
 r = out["results"][0]
