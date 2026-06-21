@@ -644,7 +644,7 @@ elif page == "Excel Rapor":
         st.download_button(
             label="📥 Raporu İndir",
             data=excel_bytes,
-            file_name=f"rapor_{tarih_str}.xlsx",
+            file_name=f"2_Arac_Planlama_Ciktisi_{tarih_str}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
         )

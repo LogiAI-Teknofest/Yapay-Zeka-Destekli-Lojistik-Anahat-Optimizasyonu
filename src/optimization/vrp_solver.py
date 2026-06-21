@@ -595,56 +595,35 @@ class SpotVRPSolver:
                 continue
 
             # Fix-61: Rota tam düğüm listesini oluştur (depot dahil değil)
-            # Her bacak (node[i] → node[i+1]) ayrı SpotAssignment olarak yazılır.
-            # Sabit kontak bedeli aracın ilk hareketinde bir kez ödenir.
+            # Her durak için ayrı SpotAssignment üretilir. Sabit kontak bedeli 
+            # aracın ilk hareketinde bir kez ödenir.
             fixed_cost_remaining = self._fixed_costs.get(vtype, 0.0)
+            
+            route_origin = demands[nodes[0] - 1][0]
+            current_location = route_origin
 
-            # Tek düğümlü rota (A → B): özel durum, direkt atama
-            if len(nodes) == 1:
-                n = nodes[0]
-                o, d, desi = demands[n - 1]
-                c = _safe_spot_cost(self._cost_matrix, o, d, vtype)
+            for node_idx in nodes:
+                req_origin, req_dest, req_desi = demands[node_idx - 1]
+                
+                c = _safe_spot_cost(self._cost_matrix, current_location, req_dest, vtype)
                 arc_cost = c if c != float("inf") else 0.0
-                assignments.append(
-                    SpotAssignment(
-                        vehicle_type  = vtype,
-                        origin        = o,
-                        destination   = d,
-                        assigned_desi = desi,
-                        capacity_desi = vcap,
-                        cost          = round(fixed_cost_remaining + arc_cost, 2),
-                        route_path    = (o, d),
-                        source        = "vrp",
-                    )
-                )
-                continue
-
-            # Fix-61: Çok duraklı rota — ardışık bacaklar halinde tara
-            for i in range(len(nodes) - 1):
-                from_n = nodes[i]
-                to_n   = nodes[i + 1]
-                o, _, _        = demands[from_n - 1]   # kaynak şehir
-                _, d, leg_desi = demands[to_n   - 1]   # hedef şehir + o bacağın talep desisi
-
-                c = _safe_spot_cost(self._cost_matrix, o, d, vtype)
-                arc_cost = c if c != float("inf") else 0.0
-
-                # Sabit kontak bedeli yalnızca ilk bacakta ödenir
+                
                 leg_cost = round(fixed_cost_remaining + arc_cost, 2)
-                fixed_cost_remaining = 0.0   # sonraki bacaklar sabit bedel ödemez
-
+                fixed_cost_remaining = 0.0   # sonraki duraklar sabit bedel ödemez
+                
                 assignments.append(
                     SpotAssignment(
                         vehicle_type  = vtype,
-                        origin        = o,
-                        destination   = d,
-                        assigned_desi = leg_desi,
+                        origin        = req_origin,
+                        destination   = req_dest,
+                        assigned_desi = req_desi,
                         capacity_desi = vcap,
                         cost          = leg_cost,
-                        route_path    = (o, d),
+                        route_path    = (current_location, req_dest),
                         source        = "vrp",
                     )
                 )
+                current_location = req_dest
 
         log.info("OR-Tools %d spot atama üretti.", len(assignments))
         return assignments

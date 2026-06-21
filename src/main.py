@@ -51,6 +51,12 @@ from utils.data_loader import DataContractError, available_dates, load_input
 from optimization.greedy import run_greedy_assignment
 from optimization.vrp_solver import run_spot_vrp
 
+# Kaptan yapısı: Kişi B çıktısı varsayılan olarak data/processed altına yazılır.
+# src/main.py -> parent (src) -> parent (proje kökü)
+_DEFAULT_OUTPUT = (
+    Path(__file__).resolve().parent.parent / "data" / "processed" / "optimization_result.json"
+)
+
 
 def _run_pipeline_for_date(
     args_tuple: tuple[dict, str, int],
@@ -284,6 +290,7 @@ def write_json_output(
 ) -> None:
     """Tüm tarih sonuçlarını tek bir JSON dosyasına yazar."""
     path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "run_info": {
             "total_dates": len(results),
@@ -295,6 +302,44 @@ def write_json_output(
     with path.open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
     log.info("JSON çıktı yazıldı: %s", path.resolve())
+
+
+def write_excel_output(results: list[PipelineResult], output_path: str | Path) -> None:
+    """Tüm tarih sonuçlarını istenen Excel formatında dışa aktarır."""
+    import pandas as pd
+    
+    rows = []
+    for r in results:
+        for a in r.rental_assignments:
+            rows.append({
+                "Tarih": r.date,
+                "Çıkış": a.origin,
+                "Varış": a.destination,
+                "Araç Tipi": a.vehicle_id,
+                "Atanan Desi": round(a.assigned_desi, 2),
+                "Maliyet": round(a.cost, 2),
+                "Durum": "Kiralık"
+            })
+        for a in r.spot_assignments:
+            route_str = " → ".join(a.route_path) if a.route_path else f"{a.origin} → {a.destination}"
+            rows.append({
+                "Tarih": r.date,
+                "Çıkış": a.origin,
+                "Varış": a.destination,
+                "Araç Tipi": a.vehicle_type,
+                "Atanan Desi": round(a.assigned_desi, 2),
+                "Maliyet": round(a.cost, 2),
+                "Durum": f"Spot ({a.source})"
+            })
+            
+    if not rows:
+        log.warning("Excel'e yazılacak atama bulunamadı.")
+        return
+
+    df = pd.DataFrame(rows)
+    path = Path(output_path)
+    df.to_excel(path, index=False)
+    log.info("Excel çıktı yazıldı: %s", path.resolve())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -327,8 +372,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output", "-o",
         metavar="FILE",
-        default=None,
-        help="Sonuçların yazılacağı JSON dosyası (isteğe bağlı).",
+        default=str(_DEFAULT_OUTPUT),
+        help=(
+            "Sonuçların yazılacağı JSON dosyası. "
+            f"Varsayılan (kaptan yapısı): {_DEFAULT_OUTPUT}"
+        ),
     )
     parser.add_argument(
         "--time-limit", "-t",
@@ -402,10 +450,14 @@ def main() -> int:
             return 1
         selected_dates = [args.date]
     else:
-        selected_dates = dates
+        # Sadece 11-17 Mayıs 2026 günleri için çalıştır (Yarışma isteği)
+        target_dates = [f"2026-05-{day:02d}" for day in range(11, 18)]
+        selected_dates = [d for d in target_dates if d in dates]
+        if not selected_dates:
+            selected_dates = dates # Fallback
         log.info(
             "Tarih belirtilmedi; %d tarih işlenecek: %s",
-            len(dates), dates,
+            len(selected_dates), selected_dates,
         )
 
     # ── Boru Hattı Çalıştırma ─────────────────────────────────────────────────
@@ -467,9 +519,12 @@ def main() -> int:
         print(f"  GENEL TOPLAM ({len(all_results)} gün): {grand_total:>14,.1f} TL")
         print(f"{'═' * 72}\n")
 
-    # ── JSON Çıktı ───────────────────────────────────────────────────────────
+    # ── Çıktı Üretimi ───────────────────────────────────────────────────────────
     if args.output:
         write_json_output(all_results, args.output)
+        
+    excel_out = Path("2_Arac_Planlama_Ciktisi.xlsx")
+    write_excel_output(all_results, excel_out)
 
     return exit_code
 

@@ -76,7 +76,9 @@ app.add_middleware(
 )
 
 # Proje kok dizini: src/app/main.py -> ../../ (proje koku)
-DATA_DIR = os.environ.get("DATA_DIR", os.path.join(_PROJECT_ROOT, "data", "raw"))
+# Kaptan yapisi: girdi JSON (Kisi A ciktisi) artik data/processed altinda;
+# data/raw yalnizca ham giris Excel'lerini barindirir.
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(_PROJECT_ROOT, "data", "processed"))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(_PROJECT_ROOT, "data", "processed"))
 INPUT_JSON = os.environ.get("INPUT_JSON", os.path.join(DATA_DIR, "logiai_mvp_input.json"))
 
