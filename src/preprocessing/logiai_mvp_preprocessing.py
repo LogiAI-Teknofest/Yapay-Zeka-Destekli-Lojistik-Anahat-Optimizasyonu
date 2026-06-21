@@ -54,6 +54,9 @@ def generate_forecast_and_excel(demand_df: pd.DataFrame, project_root: Path) -> 
     """
     Geçmiş desi talep verilerinden hareketle 11-17 Mayıs haftası için tahmin üretir
     ve istenen 'Tahminlenen Talep' Excel çıktısını kaydeder.
+    
+    [OPTIMIZED VECTORS] Gruplanmış baseline verilerini hızlı erişim için çoklu indekse (MultiIndex)
+    çevirerek iç içe döngü yavaşlamasını engeller.
     """
     # 1. Aşama: Geçmiş verinin haftanın gününü (Day of Week) buluyoruz
     demand_df['datetime'] = pd.to_datetime(demand_df['date'])
@@ -62,45 +65,47 @@ def generate_forecast_and_excel(demand_df: pd.DataFrame, project_root: Path) -> 
     # Rota ve gün bazında ortalama talep hacmini (baseline) hesaplıyoruz
     baseline = demand_df.groupby(['origin', 'destination', 'day_of_week'])['desi'].mean().reset_index()
     
+    # PERFORMANS FIX: Sürekli df filtrelemek yerine hızlı arama için (origin, destination, day_of_week) key'li bir dict yapıyoruz
+    baseline_dict = baseline.set_index(['origin', 'destination', 'day_of_week'])['desi'].to_dict()
+    
     # 2. Aşama: Hedef Tahmin Haftasını oluşturma (11 Mayıs - 17 Mayıs)
     target_dates = pd.date_range(start="2026-05-11", end="2026-05-17")
     forecast_records = []
     
     # Tüm aktif rotaları çekelim
-    routes = demand_df[['origin', 'destination']].drop_duplicates()
+    routes = demand_df[['origin', 'destination']].drop_duplicates().values  # Hız için numpy array'e çevirdik
+    total_routes = len(routes)
+    print(f"[BILGI] Toplam {total_routes} benzersiz rota için 7 günlük tahmin üretiliyor, lütfen bekleyin...")
     
     for target_date in target_dates:
         dow = target_date.dayofweek
         date_str = target_date.strftime('%Y-%m-%d')
+        print(f"  -> {date_str} tarihi hesaplanıyor...") 
         
-        for _, r in routes.iterrows():
-            # Bu rota ve bu gün için geçmiş ortalamayı bul
-            match = baseline[
-                (baseline['origin'] == r['origin']) & 
-                (baseline['destination'] == r['destination']) & 
-                (baseline['day_of_week'] == dow)
-            ]
-            
-            # Eğer geçmiş veri yoksa trendi bozmamak için 0 veya küçük bir epsilon ata
-            predicted_desi = round(float(match['desi'].values[0]), 2) if not match.empty else 0.0
+        for origin, destination in routes:
+            # Hızlı sözlük araması (O(1) Karmaşıklığı)
+            predicted_desi = baseline_dict.get((origin, destination, dow), 0.0)
             
             if predicted_desi > 0:
                 forecast_records.append({
                     "Tarih": date_str,
-                    "Çıkış TM": r['origin'],
-                    "Varış TM": r['destination'],
-                    "Tahmin Edilen Desi": predicted_desi
+                    "Çıkış TM": origin,
+                    "Varış TM": destination,
+                    "Tahmin Edilen Desi": round(float(predicted_desi), 2)
                 })
                 
     forecast_df = pd.DataFrame(forecast_records)
     
     # 3. Aşama: Şartnamede İstenen Excel Çıktısının Üretilmesi
+    output_excel_path = project_root / "data" / "processed" / "Tahminlenen_Talep.xlsx"
+    output_excel_path.parent.mkdir(parents=True, exist_ok=True)
     # Kaptan yapısı: 1. jüri teslimatı proje kökünde sabit adla durur.
     output_excel_path = project_root / "1_Tahmin_Talep_Ciktisi.xlsx"
     forecast_df.to_excel(output_excel_path, index=False)
     print(f"[BAŞARI] Şartname uyumlu 'Tahminlenen Talep' Excel'i üretildi: {output_excel_path}")
     
     return forecast_df
+
 def normalize_key(value: object) -> str:
     text = "" if pd.isna(value) else str(value)
     text = text.strip().replace("ı", "i").replace("İ", "i")
@@ -488,15 +493,24 @@ def build_logiai_mvp_contract() -> dict[str, object]:
 
 
 def main() -> None:
-    contract = build_logiai_mvp_contract()
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_PATH.write_text(json.dumps(contract, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("\n>>> LogiAI Preprocessing Islemi Basladi <<<\n")
+    try:
+        contract = build_logiai_mvp_contract()
+        OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        OUTPUT_PATH.write_text(json.dumps(contract, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"LogiAI MVP JSON kaydedildi: {OUTPUT_PATH}")
-    print(f"TM sayısı: {len(contract['distance_matrix'])}")
-    print(f"Tarih sayısı: {len(contract['daily_demand'])}")
-    print(f"Kiralık rota sayısı: {len(contract['rental_routes'])}")
-
+        print(f"LogiAI MVP JSON kaydedildi: {OUTPUT_PATH}")
+        print(f"TM sayısı: {len(contract['distance_matrix'])}")
+        print(f"Tarih sayısı: {len(contract['daily_demand'])}")
+        print(f"Kiralık rota sayısı: {len(contract['rental_routes'])}")
+        
+    except Exception as e:
+        import traceback
+        print("\n!!! KRİTİK HATA OLUŞTU VE İŞLEM YARIDA KESİLDİ !!!")
+        print(f"Hata Mesajı: {e}")
+        print("\nHata Detayı (Traceback):")
+        traceback.print_exc()
+        print("===============================================\n")
 
 if __name__ == "__main__":
     main()
