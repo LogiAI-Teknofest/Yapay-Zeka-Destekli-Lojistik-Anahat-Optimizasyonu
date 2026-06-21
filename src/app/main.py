@@ -518,30 +518,20 @@ def tm_status(tarih: Optional[str] = Query(None)):
     return _tm_density(_input_mtime(), target_date)
 
 
-@app.get("/api/excel")
-def generate_excel(
-    tarih: Optional[str] = Query(None, description="Baslangic tarihi (YYYY-MM-DD); verilmezse 2026-05-11 kullanilir"),
-    time_limit: int = Query(120, ge=1, description="Her gun icin sync optimizasyon zaman siniri (sn)"),
-    gun_sayisi: int = Query(7, ge=1, le=30, description="Kac gunluk planlama uretilecek"),
-):
+def _build_excel_zip_bytes(start_str: str, gun_sayisi: int, time_limit: int) -> bytes:
     """
-    FIX #50 (E/F/G) - Iki ayri xlsx + 7 gun loop + Tahminlenen Talep kaynagi.
+    FIX #50 (E/F/G) - Iki ayri xlsx (ZIP) cekirdegi; HTTP'den bagimsiz, bytes doner.
+    Hem sync /api/excel hem async worker (#77) bunu kullanir.
 
     Uretilen dosyalar (ZIP icinde):
-      1. Tahminlenen_Talep.xlsx  - preprocessing'in urettigi dosyadan dogrudan kopyalanir
-                                    (format: Tarih, Cikis TM, Varis TM, Tahmin Edilen Desi)
-      2. Arac_Planlama.xlsx     - gun_sayisi gun boyunca optimizasyon calistirilir;
-                                    juri formati: Tarih, Arac Tipi, Cikis TM, Varis TM,
-                                    Atanan Desi, Maliyet  (kiralik + spot satirlari)
-
-    Tarih araligi: tarih parametresi (varsayilan 2026-05-11) + gun_sayisi gun
+      1. 1_Tahmin_Talep_Ciktisi.xlsx - preprocessing'in koke yazdigi forecast'ten kopyalanir
+      2. 2_Arac_Planlama_Ciktisi.xlsx - gun_sayisi gun optimizasyon (juri formati + Maliyet Ozeti)
     """
     import io
     import zipfile
     import openpyxl
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
-    from fastapi.responses import StreamingResponse
 
     # --- 0. Ortak stil nesneleri ---
     header_font  = Font(bold=True, color="FFFFFF")
@@ -556,9 +546,10 @@ def generate_excel(
         for v in vehicles:
             id_to_vtype[v["id"]] = v.get("vehicle_type", "TIR")
 
-    # --- 1. DOSYA A: Tahminlenen_Talep.xlsx ---
-    # Oncelik: data/raw/Tahminlened_Talep.xlsx mevcutsa dogrudan oku
-    talep_src = os.path.join(DATA_DIR, "Tahminlenen_Talep.xlsx")
+    # --- 1. DOSYA A: 1_Tahmin_Talep_Ciktisi.xlsx ---
+    # Yeni yapi: preprocessing forecast'i repo koküne 1_Tahmin_Talep_Ciktisi.xlsx
+    # olarak yazar; mevcutsa dogrudan oku.
+    talep_src = os.path.join(_PROJECT_ROOT, "1_Tahmin_Talep_Ciktisi.xlsx")
     if os.path.exists(talep_src):
         wb_talep = openpyxl.load_workbook(talep_src)
         ws_talep = wb_talep.active
@@ -591,8 +582,6 @@ def generate_excel(
             row_idx += 1
 
     # --- 2. DOSYA B: Arac_Planlama.xlsx ---
-    # Baslangic tarihini belirle
-    start_str = tarih or "2026-05-11"
     try:
         start_date = datetime.date.fromisoformat(start_str)
     except ValueError:
@@ -698,18 +687,99 @@ def generate_excel(
     with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         talep_buf = io.BytesIO()
         wb_talep.save(talep_buf)
-        zf.writestr("Tahminlenen_Talep.xlsx", talep_buf.getvalue())
+        zf.writestr("1_Tahmin_Talep_Ciktisi.xlsx", talep_buf.getvalue())
 
         plan_buf = io.BytesIO()
         wb_plan.save(plan_buf)
-        zf.writestr("Arac_Planlama.xlsx", plan_buf.getvalue())
+        zf.writestr("2_Arac_Planlama_Ciktisi.xlsx", plan_buf.getvalue())
 
-    zip_buf.seek(0)
+    return zip_buf.getvalue()
+
+
+@app.get("/api/excel")
+def generate_excel(
+    tarih: Optional[str] = Query(None, description="Baslangic tarihi (YYYY-MM-DD); verilmezse 2026-05-11"),
+    time_limit: int = Query(120, ge=1, description="Her gun icin sync optimizasyon zaman siniri (sn)"),
+    gun_sayisi: int = Query(7, ge=1, le=30, description="Kac gunluk planlama uretilecek"),
+):
+    """
+    Senkron Excel uretimi. Buyuk gun_sayisi (orn. 7) optimizasyon kostugundan
+    dakikalarca surebilir; dashboard 30sn timeout'una takilirsa /api/excel/async kullanin (#77).
+    """
+    import io as _io
+    from fastapi.responses import StreamingResponse
+    start_str = tarih or "2026-05-11"
+    zip_bytes = _build_excel_zip_bytes(start_str, gun_sayisi, time_limit)
     return StreamingResponse(
-        zip_buf,
+        _io.BytesIO(zip_bytes),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="logiai_cikti_{start_str}.zip"'},
     )
+
+
+@app.post("/api/excel/async")
+def excel_async(
+    background_tasks: BackgroundTasks,
+    tarih: Optional[str] = Query(None, description="Baslangic tarihi (YYYY-MM-DD); verilmezse 2026-05-11"),
+    time_limit: int = Query(120, ge=1, description="Her gun icin optimizasyon zaman siniri (sn)"),
+    gun_sayisi: int = Query(7, ge=1, le=30, description="Kac gunluk planlama uretilecek"),
+):
+    """
+    FIX #77 - Excel uretimini arka planda calistirir; istek aninda bloke olmaz
+    (7 gun x time_limit = dakikalar surebilir, dashboard 30sn timeout'una takilmaz).
+
+    Hemen job_id doner. Istemci /api/jobs/{job_id} ile durumu izler;
+    COMPLETED olunca /api/excel/result/{job_id} ile ZIP'i indirir.
+    """
+    start_str = tarih or "2026-05-11"
+    try:
+        datetime.date.fromisoformat(start_str)
+    except ValueError:
+        raise HTTPException(400, f"Gecersiz tarih formati: {start_str}. YYYY-MM-DD olmali.")
+
+    if not _semaphore.acquire(blocking=False):
+        raise HTTPException(429, f"Maksimum eszamanli is sayisina ({_MAX_CONCURRENT_JOBS}) ulasildi.")
+
+    job_id = create_job()
+
+    def _worker():
+        set_running(job_id)
+        try:
+            zip_bytes = _build_excel_zip_bytes(start_str, gun_sayisi, time_limit)
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            path = os.path.join(OUTPUT_DIR, f"logiai_cikti_{start_str}.zip")
+            with open(path, "wb") as fh:
+                fh.write(zip_bytes)
+            set_completed(job_id, {"file": path, "date": start_str})
+        except Exception as exc:
+            logger.exception("Excel worker hatasi job_id=%s", job_id)
+            try:
+                set_failed(job_id, str(exc))
+            except Exception as inner:
+                logger.error("set_failed basarisiz job_id=%s: %s", job_id, inner)
+        finally:
+            _semaphore.release()
+
+    background_tasks.add_task(_worker)
+    return {"job_id": job_id, "status": "PENDING"}
+
+
+@app.get("/api/excel/result/{job_id}")
+def excel_result(job_id: str):
+    """FIX #77 - Tamamlanmis Excel job'unun ZIP dosyasini indirir."""
+    from fastapi.responses import FileResponse
+    job = _get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job bulunamadi veya suresi doldu (TTL: 1 saat).")
+    status = job.get("status")
+    if status == "FAILED":
+        raise HTTPException(500, f"Excel uretimi basarisiz: {job.get('error', '?')}")
+    if status != "COMPLETED":
+        raise HTTPException(409, f"Excel henuz hazir degil (durum: {status}).")
+    path = (job.get("result") or {}).get("file")
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "Cikti dosyasi bulunamadi.")
+    return FileResponse(path, media_type="application/zip", filename=os.path.basename(path))
 
 
 
