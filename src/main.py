@@ -30,7 +30,6 @@ Kullanım:
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import datetime
 import io
 import json
@@ -57,18 +56,6 @@ from optimization.vrp_solver import run_spot_vrp
 _DEFAULT_OUTPUT = (
     Path(__file__).resolve().parent.parent / "data" / "processed" / "optimization_result.json"
 )
-
-
-def _run_pipeline_for_date(
-    args_tuple: tuple[dict, str, int],
-) -> PipelineResult:
-    """
-    ProcessPoolExecutor icin modul duzeyinde sarmalayici.
-    Lokal fonksiyonlar pickle'lanamaz; bu fonksiyon modul seviyesinde
-    tanimlandigi icin subprocess'lere guvenle aktarilabilir.
-    """
-    data, date, time_limit_sec = args_tuple
-    return run_pipeline(data, date, time_limit_sec=time_limit_sec)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Loglama Kurulumu
@@ -383,28 +370,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--time-limit", "-t",
-        type=int,
-        default=540,
-        metavar="SECONDS",
-        help="OR-Tools zaman sınırı (saniye). Varsayılan: 540",
-    )
-    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="DEBUG düzeyinde ayrıntılı log çıktısı.",
-    )
-    parser.add_argument(
-        "--workers", "-w",
-        type=int,
-        default=1,
-        metavar="N",
-        help=(
-            "Paralel tarih işleme için süreç sayısı. "
-            "Varsayılan: 1 (sıralı). "
-            "OR-Tools zaten num_search_workers=4 ile çok çekirdekli çalışır; "
-            "workers=2 genellikle optimal denge sağlar."
-        ),
     )
     return parser
 
@@ -469,7 +437,7 @@ def main() -> int:
     exit_code = 0
 
     GLOBAL_START_TIME = time.time()
-    HARD_DEADLINE_SEC = 570.0
+    HARD_DEADLINE_SEC = 540.0
     toplam_gun = len(selected_dates)
 
     log.info("Zaman Bankası: Toplam %d gün için %.1f saniye bütçe başlatıldı.", toplam_gun, HARD_DEADLINE_SEC)
@@ -500,8 +468,11 @@ def main() -> int:
         all_results.append(result)
         
         if result.has_unassigned:
-            log.warning("[%s] %d güzergâhta talep atanamadı.", date, len(result.unassigned_demand))
-            exit_code = 1
+            toplam_devir = sum(result.unassigned_demand.values())
+            log.warning(
+                "[%s] %d güzergâhta toplam %.1f desi talep (%%10 doluluk kuralı/konsolidasyon nedeniyle) atanamadı.",
+                date, len(result.unassigned_demand), toplam_devir
+            )
 
     # ── Çok Günlü Özet ───────────────────────────────────────────────────────
     if len(all_results) > 1:

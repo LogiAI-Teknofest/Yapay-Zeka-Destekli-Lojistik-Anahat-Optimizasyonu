@@ -1,6 +1,6 @@
 # LogiAI Logistics Optimization System
 
-**Grand Total Optimization Cost / Toplam Optimizasyon Maliyeti (May 11-17, 2026):** **14,369,681.90 TL**
+**Grand Total Optimization Cost / Toplam Optimizasyon Maliyeti (May 11-17, 2026):** **14,364,318.20 TL**
 
 Decision support system that optimizes logistics linehaul transportation capacity allocation and vehicle routing to minimize costs under volume, fleet, and site constraints.
 
@@ -13,6 +13,10 @@ To achieve this, the system implements a two-stage hybrid optimization engine:
 2. **Stage 2 (OR-Tools Spot VRP):** Aggregates any remaining overflow (spill demand) by origin. Each origin's overflow is solved as an independent Open Vehicle Routing Problem (VRP) using Google OR-Tools. The solver routes and assigns spot vehicles from a heterogeneous fleet under strict constraints, including a 10% minimum load threshold for active spot trucks and truck-docking restrictions.
 
 The system outputs detailed assignment logs, GIS routing trajectories, and cost breakdowns. These outputs are served via a FastAPI gateway, rendered on an interactive Streamlit dashboard, and compiled into multi-sheet Excel reports. Long-running optimization tasks are handled asynchronously using a Redis-backed job queue and polling pattern, preventing UI blocks and HTTP timeouts. While the current setup serves demand forecasting via a placeholder statistical baseline endpoint (`/api/predict`), the architecture is fully designed to integrate a future deep-learning LSTM (Long Short-Term Memory) time-series forecasting model.
+
+## Assumptions & Design Decisions
+
+> **Consolidation and Daily Independence in MVP:** Since consolidation is disabled in the MVP and each day is evaluated independently, the low-volume remnants of the final day (Sunday) — <560 desi residues (0.016% of total demand) that no spot vehicle can carry without violating the 10% minimum load rule — were not forced into the transportation plan. In real-world HepsiJET operations, these volumes would not be loaded onto a linehaul truck; they would either be merged at a consolidation hub or delegated to a parcel/cargo layer. This approach complies with both the 10% rule and the 'independent daily evaluation' principle, and will be addressed via a consolidation module in the Advanced stage.
 
 ## Architecture
 

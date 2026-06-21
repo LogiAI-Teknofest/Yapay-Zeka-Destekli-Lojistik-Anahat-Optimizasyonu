@@ -619,7 +619,7 @@ class SpotVRPSolver:
                 
                 c = _safe_spot_cost(self._cost_matrix, current_location, req_dest, vtype)
                 # Issue 48 Fix: inf maliyeti bedava sanma, aşırı yüksek bir rakam yansıt
-                arc_cost = c if c != float("inf") else 9999999.0
+                arc_cost = c if c != float("inf") else float(_INFEASIBLE_COST)
                 
                 leg_cost = round(fixed_cost_remaining + arc_cost, 2)
                 fixed_cost_remaining = 0.0   # sonraki duraklar sabit bedel ödemez
