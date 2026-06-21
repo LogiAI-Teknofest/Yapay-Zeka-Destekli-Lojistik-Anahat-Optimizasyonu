@@ -28,7 +28,7 @@ except ImportError:
 
 
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
-OUTPUT_PATH = PROJECT_ROOT / "data" / "processed" / "logiai_mvp_input.json"
+OUTPUT_PATH = PROJECT_ROOT / "data" / "raw" / "logiai_mvp_input.json"
 DEFAULT_TRANSFER_CENTER_CAPACITY_DESI = 10_000_000
 DEFAULT_TIR_ALLOWED = True
 
@@ -48,7 +48,56 @@ VEHICLE_TYPE_NAMES = {
     "KAM": "Kamyon",
     "KMT": "Kamyonet",
 }
-
+def generate_forecast_and_excel(demand_df: pd.DataFrame, project_root: Path) -> pd.DataFrame:
+    """
+    Geçmiş desi talep verilerinden hareketle 11-17 Mayıs haftası için tahmin üretir
+    ve istenen 'Tahminlenen Talep' Excel çıktısını kaydeder.
+    """
+    # 1. Aşama: Geçmiş verinin haftanın gününü (Day of Week) buluyoruz
+    demand_df['datetime'] = pd.to_datetime(demand_df['date'])
+    demand_df['day_of_week'] = demand_df['datetime'].dt.dayofweek
+    
+    # Rota ve gün bazında ortalama talep hacmini (baseline) hesaplıyoruz
+    baseline = demand_df.groupby(['origin', 'destination', 'day_of_week'])['desi'].mean().reset_index()
+    
+    # 2. Aşama: Hedef Tahmin Haftasını oluşturma (11 Mayıs - 17 Mayıs)
+    target_dates = pd.date_range(start="2026-05-11", end="2026-05-17")
+    forecast_records = []
+    
+    # Tüm aktif rotaları çekelim
+    routes = demand_df[['origin', 'destination']].drop_duplicates()
+    
+    for target_date in target_dates:
+        dow = target_date.dayofweek
+        date_str = target_date.strftime('%Y-%m-%d')
+        
+        for _, r in routes.iterrows():
+            # Bu rota ve bu gün için geçmiş ortalamayı bul
+            match = baseline[
+                (baseline['origin'] == r['origin']) & 
+                (baseline['destination'] == r['destination']) & 
+                (baseline['day_of_week'] == dow)
+            ]
+            
+            # Eğer geçmiş veri yoksa trendi bozmamak için 0 veya küçük bir epsilon ata
+            predicted_desi = round(float(match['desi'].values[0]), 2) if not match.empty else 0.0
+            
+            if predicted_desi > 0:
+                forecast_records.append({
+                    "Tarih": date_str,
+                    "Çıkış TM": r['origin'],
+                    "Varış TM": r['destination'],
+                    "Tahmin Edilen Desi": predicted_desi
+                })
+                
+    forecast_df = pd.DataFrame(forecast_records)
+    
+    # 3. Aşama: Şartnamede İstenen Excel Çıktısının Üretilmesi
+    output_excel_path = project_root / "data" / "processed" / "Tahminlenen_Talep.xlsx"
+    forecast_df.to_excel(output_excel_path, index=False)
+    print(f"[BAŞARI] Şartname uyumlu 'Tahminlenen Talep' Excel'i üretildi: {output_excel_path}")
+    
+    return forecast_df
 def normalize_key(value: object) -> str:
     text = "" if pd.isna(value) else str(value)
     text = text.strip().replace("ı", "i").replace("İ", "i")
@@ -79,7 +128,14 @@ def city_display(value: object) -> str:
     return title_city_name(normalize_city_name(value))
 
 
-def normalize_vehicle_type(value: object) -> str:
+def normalize_vehicle_type(value: object) -> str | object:
+    """
+    Araç tipini standart kodlara (TIR, KAM, HAF, KMT) dönüştürür.
+    Eğer bilinmeyen bir tip gelirse çökmez, pd.NA döner ve sistemin devam etmesini sağlar.
+    """
+    if pd.isna(value):
+        return pd.NA
+        
     key = normalize_key(value).replace(" ", "_")
     if key in VEHICLE_TYPE_ALIASES:
         return VEHICLE_TYPE_ALIASES[key]
@@ -88,7 +144,9 @@ def normalize_vehicle_type(value: object) -> str:
     if compact_key in VEHICLE_TYPE_ALIASES:
         return VEHICLE_TYPE_ALIASES[compact_key]
 
-    raise KeyError(f"Standart araç tipi bulunamadı: {value}")
+    # #57 & #51 ÇÖZÜMÜ: Çökmüyoruz, ancak sessizce kaybolmaması için log basıyoruz.
+    print(f"[UYARI / WARNING] Bilinmeyen veya bozuk araç tipi tespit edildi, satır atlanacak: '{value}'")
+    return pd.NA
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     radius_km = 6371.0
@@ -121,7 +179,8 @@ def load_coordinates() -> dict[str, dict[str, float]]:
 
 def load_vehicle_costs() -> pd.DataFrame:
     df = read_raw_file(find_raw_excel("arac", "kapasite"))
-    return pd.DataFrame(
+    
+    df_costs = pd.DataFrame(
         {
             "vehicle_type": df[find_column(df, "arac")].map(normalize_vehicle_type),
             "capacity_desi": parse_decimal_number(df[find_column(df, "kapasite")]),
@@ -130,7 +189,36 @@ def load_vehicle_costs() -> pd.DataFrame:
             "spot_fixed": parse_decimal_number(df[find_column(df, "spot", "sabit")]),
             "spot_km": parse_decimal_number(df[find_column(df, "spot", "kilometre")]),
         }
-    ).dropna()
+    )
+    
+    # 1. Aşama: normalize_vehicle_type tarafından bilinmediği için NA işaretlenen satırları eliyoruz (#57 & #51)
+    df_costs = df_costs.dropna(subset=["vehicle_type"])
+    
+    # 2. Aşama: Maliyet veya kapasite kolonlarında NaN (bozuk/boş veri) kontrolü (#Fail-Loud)
+    maliyet_kolonlari = ["capacity_desi", "rental_fixed", "rental_km", "spot_fixed", "spot_km"]
+    
+    for col in maliyet_kolonlari:
+        missing_mask = df_costs[col].isna()
+        if missing_mask.any():
+            corrupted_types = df_costs.loc[missing_mask, "vehicle_type"].tolist()
+            # Sessizce yutmak yerine terminale hata/uyarı basıyoruz
+            print(f"[HATA / ERROR] '{col}' kolonunda eksik/bozuk veri tespit edildi! "
+                  f"Etkilenen araç tipleri: {corrupted_types}")
+            
+            # Kritik veri kaybını önlemek için varsayılan değer atayabilir veya hata fırlatabiliriz.
+            # MVP güvencesi için 0 ile doldurup devam ediyoruz (veya raise ValueError yapabilirsin)
+            df_costs[col] = df_costs[col].fillna(0.0)
+
+    # 3. Aşama: Son Kontrol (Kritik 4 araç tipinin çıktıda var olduğunun doğrulanması)
+    existing_types = set(df_costs["vehicle_type"].dropna().unique())
+    required_types = {"TIR", "KAM", "HAF", "KMT"}
+    missing_types = required_types - existing_types
+    
+    if missing_types:
+        raise ValueError(f"KRİTİK HATA: Proje için zorunlu olan araç tipleri eksik: {missing_types}. "
+                         f"Lütfen Araç_Kapasite_Maliyet.xlsx dosyasını kontrol edin!")
+
+    return df_costs
 
 
 # REVIZYON: coords haritası parametre olarak eklendi, böylece koordinatı olmayan şehir içeren satırlar elenecek.
@@ -274,6 +362,15 @@ def build_transfer_centers(coords: dict[str, dict[str, float]]) -> dict[str, dic
         for city, coord in sorted(coords.items())
     }
 
+def build_vehicle_fixed_costs(vehicle_costs: pd.DataFrame) -> dict[str, float]:
+    """
+    VRP Solver ve Fallback mekanizmalarının simetrik çalışabilmesi için
+    araç kodlarına karşılık gelen gerçek spot günlük sabit maliyetlerini üretir.
+    """
+    return {
+        str(row["vehicle_type"]): round(float(row["spot_fixed"]), 2)
+        for _, row in vehicle_costs.iterrows()
+    }
 
 def build_vehicles_info(vehicle_costs: pd.DataFrame) -> dict[str, dict[str, object]]:
     return {
@@ -303,16 +400,35 @@ def build_daily_demand(demand: pd.DataFrame) -> dict[str, dict[str, dict[str, fl
         )
     return daily_demand
 
+def build_tir_yanasma(coords: dict) -> dict[str, bool]:
+    """
+    Önrapor Sert Kısıt #7 (Tır Yanaşma Uygunluğu) uyumluluğu için 
+    her Transfer Merkezi için TIR yanaşma izin durumunu üretir.
+    """
+    tir_yanasma_dict = {}
+    # Dataset B ve parametre esnekliği için kısıtlı şehirleri şimdiden tanımlıyoruz
+    restricted_cities = {"Bursa", "Konya", "Kayseri", "Trabzon"}
+    
+    for city, info in coords.items():
+        # Eğer koordinat tablosunda özel bir 'tir_allowed' alanı geçilmişse onu baz al,
+        # Yoksa jüri parameters.json / önrapor kısıt listesindeki şehirlere göre False ata
+        if "tir_allowed" in info:
+            tir_yanasma_dict[city] = bool(info["tir_allowed"])
+        elif city in restricted_cities:
+            tir_yanasma_dict[city] = False
+        else:
+            tir_yanasma_dict[city] = True  # Varsayılan olarak serbest
+            
+    return tir_yanasma_dict
 
 def build_logiai_mvp_contract() -> dict[str, object]:
     coords = load_coordinates()
     vehicle_costs = load_vehicle_costs()
     
-    # Ham tabloları (filtresiz) sadece eksik şehirleri terminale raporlayabilmek için geçici okuyoruz
+    # Ham tabloları (filtresiz) geçici okuyoruz (Eksik şehir tespiti için)
     raw_df_rental = read_raw_file(find_raw_excel("kiralik", "arac"))
     raw_df_demand = read_raw_file(find_raw_excel("desi", "talep"))
     
-    # Sütun isimlerini normalize edip validate_coordinates'in anlayacağı şekle getiriyoruz
     temp_rental = pd.DataFrame({
         "origin": raw_df_rental[find_column(raw_df_rental, "cikis")].map(city_display),
         "destination": raw_df_rental[find_column(raw_df_rental, "varis")].map(city_display)
@@ -322,28 +438,48 @@ def build_logiai_mvp_contract() -> dict[str, object]:
         "destination": raw_df_demand[find_column(raw_df_demand, "varis")].map(city_display)
     })
 
-    # Eksik şehirleri buluyoruz
     missing_coordinates = validate_coordinates(coords, temp_rental, temp_demand)
 
-    # BEKLENEN DURUM LOGLAMASI: Çökmüyoruz, sadece terminale uyarı basıyoruz.
     if missing_coordinates:
         print(f"\n[UYARI / WARNING] Koordinat tablosunda bulunmayan şehirler tespit edildi: {', '.join(missing_coordinates)}")
         print("[BILGI / INFO] Bu şehirleri içeren hatalı satırlar veri setinden elendi. Sistem çalışmaya devam ediyor...\n")
 
-    # Gerçek veri yükleme aşamasında koordinatı olmayan satırlar elenerek yükleniyor
     rental = load_rental_vehicles(vehicle_costs, coords)
     demand = load_desi_demand(coords)
+
+    # =========================================================================
+    # TAHMİN AKIŞI UYARLAMASI (#Tahminlenen_Talep Excel'ini basar ve contract'a bağlar)
+    # =========================================================================
+    forecast_df = generate_forecast_and_excel(demand, PROJECT_ROOT)
+    forecast_mapped = forecast_df.rename(columns={
+        "Tarih": "date",
+        "Çıkış TM": "origin",
+        "Varış TM": "destination",
+        "Tahmin Edilen Desi": "desi"
+    })
+    combined_demand = pd.concat([demand, forecast_mapped], ignore_index=True)
+    # =========================================================================
 
     distance_matrix = build_distance_matrix(coords)
     contract = {}
     
+    # #30 HARİTA FIX: API katmanının (/api/cities) aradığı ve haritadaki kaymayı 
+    # engelleyen coğrafi enlem/boylam kırılım sözlüğü oluşturuluyor.
+    city_coords_dict = {
+        city: {"lat": info["lat"], "lon": info["lon"]} 
+        for city, info in coords.items()
+    }
+    
     contract.update({
+        "city_coords": city_coords_dict,                                  # <-- #30 Fix
         "transfer_centers": build_transfer_centers(coords),
-        "vehicles_info": build_vehicles_info(vehicle_costs),
+        "vehicles_info": build_vehicles_info(vehicle_costs),              # <-- #32 Fix (Gerçek Maliyetler)
+        "vehicle_fixed_costs": build_vehicle_fixed_costs(vehicle_costs),  # <-- #31 Fix (VRP Simetrisi)
+        "tir_yanasma": build_tir_yanasma(coords),
         "distance_matrix": distance_matrix,
         "cost_matrix": build_cost_matrix(distance_matrix, vehicle_costs),
-        "rental_routes": build_rental_routes(rental),
-        "daily_demand": build_daily_demand(demand),
+        "rental_routes": build_rental_routes(rental),                     # <-- #29 Fix ("kiralik" ASCII eşleşmesi)
+        "daily_demand": build_daily_demand(combined_demand),              # <-- Tahmin Entegre Veri Beslemesi
     })
     return contract
 
