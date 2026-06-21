@@ -30,18 +30,38 @@ Kullanım:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime
+import io
 import json
 import logging
 import sys
 from pathlib import Path
 from typing import Any
 
+# Windows terminalleri varsayılan olarak CP1254 kullanır; kutu çizgi
+# karakterleri (═, ─) bu kodlamada tanımsız. stdout'u UTF-8'e zorla.
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf_8"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 # ── İç modüller ──────────────────────────────────────────────────────────────
 from models.data_types import PipelineResult, RentalAssignment, SpotAssignment
 from utils.data_loader import DataContractError, available_dates, load_input
 from optimization.greedy import run_greedy_assignment
 from optimization.vrp_solver import run_spot_vrp
+
+
+def _run_pipeline_for_date(
+    args_tuple: tuple[dict, str, int],
+) -> PipelineResult:
+    """
+    ProcessPoolExecutor icin modul duzeyinde sarmalayici.
+    Lokal fonksiyonlar pickle'lanamaz; bu fonksiyon modul seviyesinde
+    tanimlandigi icin subprocess'lere guvenle aktarilabilir.
+    """
+    data, date, time_limit_sec = args_tuple
+    return run_pipeline(data, date, time_limit_sec=time_limit_sec)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Loglama Kurulumu
@@ -322,6 +342,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="DEBUG düzeyinde ayrıntılı log çıktısı.",
     )
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Paralel tarih işleme için süreç sayısı. "
+            "Varsayılan: 1 (sıralı). "
+            "OR-Tools zaten num_search_workers=4 ile çok çekirdekli çalışır; "
+            "workers=2 genellikle optimal denge sağlar."
+        ),
+    )
     return parser
 
 
@@ -379,18 +411,54 @@ def main() -> int:
     # ── Boru Hattı Çalıştırma ─────────────────────────────────────────────────
     all_results: list[PipelineResult] = []
     exit_code = 0
+    n_workers = max(1, args.workers)
 
-    for date in selected_dates:
-        result = run_pipeline(data, date, time_limit_sec=args.time_limit)
-        print_result(result)
-        all_results.append(result)
+    if n_workers == 1 or len(selected_dates) == 1:
+        # ── Sıralı mod ────────────────────────────────────────────────────────
+        for date in selected_dates:
+            result = run_pipeline(data, date, time_limit_sec=args.time_limit)
+            print_result(result)
+            all_results.append(result)
+            if result.has_unassigned:
+                log.warning(
+                    "[%s] %d güzergâhta talep atanamadı.",
+                    date, len(result.unassigned_demand),
+                )
+                exit_code = 1
+    else:
+        # ── Paralel mod: her tarih ayri surecte islenir ───────────────────────
+        log.info(
+            "%d tarih %d paralel surecle islenecek.",
+            len(selected_dates), n_workers,
+        )
 
-        if result.has_unassigned:
-            log.warning(
-                "[%s] %d güzergâhta talep atanamadı.",
-                date, len(result.unassigned_demand),
-            )
-            exit_code = 1
+        task_args = [(data, d, args.time_limit) for d in selected_dates]
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(_run_pipeline_for_date, arg): arg[1]
+                for arg in task_args
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                date = futures[fut]
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    log.error("[%s] Islem hatasi: %s", date, exc)
+                    exit_code = 1
+                    continue
+                print_result(result)
+                all_results.append(result)
+                if result.has_unassigned:
+                    log.warning(
+                        "[%s] %d guzergahta talep atanamadir.",
+                        date, len(result.unassigned_demand),
+                    )
+                    exit_code = 1
+
+        # Ciktiyi tarih sirasina gore yeniden sirala
+        date_order = {d: i for i, d in enumerate(selected_dates)}
+        all_results.sort(key=lambda r: date_order.get(r.date, 9999))
 
     # ── Çok Günlü Özet ───────────────────────────────────────────────────────
     if len(all_results) > 1:
