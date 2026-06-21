@@ -134,6 +134,8 @@ def _cheapest_spot_vehicle(
     (vehicle_type, unit_cost, capacity_desi) veya None
     """
     best: tuple[str, float, float] | None = None
+    if remaining_desi <= 0:
+        return best
     best_cost_per_desi = float("inf")
 
     for vtype, cap in spot_caps.items():

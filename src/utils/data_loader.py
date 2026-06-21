@@ -246,8 +246,20 @@ def _sanitize_daily_demand(daily_demand: dict, known_cities: set) -> dict:
                 continue
             valid = {}
             for dest, desi in dests.items():
-                if dest in known_cities and isinstance(desi, (int, float)) and desi >= 0:
-                    valid[dest] = desi
+                if dest not in known_cities:
+                    skipped += 1
+                    continue
+                try:
+                    desi_f = float(desi)
+                except (ValueError, TypeError):
+                    log.warning(
+                        "daily_demand['%s']['%s']['%s'] sayıya çevrilemedi (%r), atlandı.",
+                        date_str, origin, dest, desi,
+                    )
+                    skipped += 1
+                    continue
+                if desi_f >= 0:
+                    valid[dest] = desi_f
                 else:
                     skipped += 1
             if valid:

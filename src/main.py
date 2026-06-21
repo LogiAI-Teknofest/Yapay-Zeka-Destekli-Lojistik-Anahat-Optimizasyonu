@@ -36,6 +36,7 @@ import io
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -152,7 +153,9 @@ def run_pipeline(
     unassigned: dict[tuple[str, str], float] = {}
     for (o, d), desi in spill_demand.items():
         leftover = desi - assigned_spill.get((o, d), 0.0)
-        if leftover > 1.0:
+        # Senaryo 5.1 Yamasi: Float tozlarini temizle, 0'dan buyuk her artan kutleyi koru
+        leftover = round(leftover, 4)
+        if leftover > 0:
             unassigned[(o, d)] = leftover
 
     elapsed = (datetime.datetime.now() - start_time).total_seconds()
@@ -461,57 +464,44 @@ def main() -> int:
             len(selected_dates), selected_dates,
         )
 
-    # ── Boru Hattı Çalıştırma ─────────────────────────────────────────────────
+    # ── Boru Hattı Çalıştırma (Dinamik Zaman Bankası) ────────────────────────
     all_results: list[PipelineResult] = []
     exit_code = 0
-    n_workers = max(1, args.workers)
 
-    if n_workers == 1 or len(selected_dates) == 1:
-        # ── Sıralı mod ────────────────────────────────────────────────────────
-        for date in selected_dates:
-            result = run_pipeline(data, date, time_limit_sec=args.time_limit)
-            print_result(result)
-            all_results.append(result)
-            if result.has_unassigned:
-                log.warning(
-                    "[%s] %d güzergâhta talep atanamadı.",
-                    date, len(result.unassigned_demand),
-                )
+    GLOBAL_START_TIME = time.time()
+    HARD_DEADLINE_SEC = 570.0
+    toplam_gun = len(selected_dates)
+
+    log.info("Zaman Bankası: Toplam %d gün için %.1f saniye bütçe başlatıldı.", toplam_gun, HARD_DEADLINE_SEC)
+
+    for islenen_gun, date in enumerate(selected_dates):
+        # Panik Freni (Kill-Switch)
+        if time.time() - GLOBAL_START_TIME > HARD_DEADLINE_SEC:
+            log.warning(
+                "⚠️ PANIK FRENİ: %.1f saniye sınırı aşıldı! %s ve sonrasındaki günler kaba rotaya (Fallback) devrediliyor.",
+                HARD_DEADLINE_SEC, date
+            )
+            for remaining_date in selected_dates[islenen_gun:]:
+                # Süre bittiği için 1 saniye limit vererek anında fallback zorluyoruz
+                res = run_pipeline(data, remaining_date, time_limit_sec=1)
+                print_result(res)
+                all_results.append(res)
                 exit_code = 1
-    else:
-        # ── Paralel mod: her tarih ayri surecte islenir ───────────────────────
-        log.info(
-            "%d tarih %d paralel surecle islenecek.",
-            len(selected_dates), n_workers,
-        )
+            break
 
-        task_args = [(data, d, args.time_limit) for d in selected_dates]
+        kalan_sure = HARD_DEADLINE_SEC - (time.time() - GLOBAL_START_TIME)
+        kalan_gun_sayisi = toplam_gun - islenen_gun
+        gunluk_limit = max(5.0, kalan_sure / kalan_gun_sayisi)
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {
-                pool.submit(_run_pipeline_for_date, arg): arg[1]
-                for arg in task_args
-            }
-            for fut in concurrent.futures.as_completed(futures):
-                date = futures[fut]
-                try:
-                    result = fut.result()
-                except Exception as exc:
-                    log.error("[%s] Islem hatasi: %s", date, exc)
-                    exit_code = 1
-                    continue
-                print_result(result)
-                all_results.append(result)
-                if result.has_unassigned:
-                    log.warning(
-                        "[%s] %d guzergahta talep atanamadir.",
-                        date, len(result.unassigned_demand),
-                    )
-                    exit_code = 1
-
-        # Ciktiyi tarih sirasina gore yeniden sirala
-        date_order = {d: i for i, d in enumerate(selected_dates)}
-        all_results.sort(key=lambda r: date_order.get(r.date, 9999))
+        log.info("Dinamik Bütçe: [%s] için %d sn ayrıldı (Kalan toplam süre: %d sn).", date, int(gunluk_limit), int(kalan_sure))
+        
+        result = run_pipeline(data, date, time_limit_sec=int(gunluk_limit))
+        print_result(result)
+        all_results.append(result)
+        
+        if result.has_unassigned:
+            log.warning("[%s] %d güzergâhta talep atanamadı.", date, len(result.unassigned_demand))
+            exit_code = 1
 
     # ── Çok Günlü Özet ───────────────────────────────────────────────────────
     if len(all_results) > 1:
@@ -520,12 +510,18 @@ def main() -> int:
         print(f"  GENEL TOPLAM ({len(all_results)} gün): {grand_total:>14,.1f} TL")
         print(f"{'═' * 72}\n")
 
-    # ── Çıktı Üretimi ───────────────────────────────────────────────────────────
+    # ── Çıktı Üretimi & Çift Excel Güvencesi ─────────────────────────────────
     if args.output:
         write_json_output(all_results, args.output)
         
     excel_out = Path("2_Arac_Planlama_Ciktisi.xlsx")
     write_excel_output(all_results, excel_out)
+
+    tahmin_out = Path("1_Tahmin_Talep_Ciktisi.xlsx")
+    if tahmin_out.exists():
+        log.info("✅ Çift Excel Güvencesi: '%s' ve '%s' başarıyla güvenceye alındı ve diske yazıldı.", tahmin_out.name, excel_out.name)
+    else:
+        log.warning("⚠️ Çift Excel Güvencesi: '%s' diske yazıldı, ancak '%s' dizinde bulunamadı!", excel_out.name, tahmin_out.name)
 
     return exit_code
 

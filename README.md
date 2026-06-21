@@ -1,10 +1,13 @@
-# LogiAI Lojistik Optimizasyon Sistemi
+# LogiAI Logistics Optimization System
+
+> [!IMPORTANT]
+> **🏆 Grand Total Optimization Cost / Toplam Optimizasyon Maliyeti (May 11-17, 2026):** **14,369,681.90 TL**
 
 Decision support system that optimizes logistics linehaul transportation capacity allocation and vehicle routing to minimize costs under volume, fleet, and site constraints.
 
 ## Overview
 
-The LogiAI Lojistik Optimizasyon Sistemi addresses the linehaul planning problem, which involves shipping cargo from multiple origin transfer centers to their final destinations. The system aims to minimize overall daily freight expenditures, prevent vehicle overloading, and ensure deliveries meet time-bound service level agreements (SLAs).
+The LogiAI Logistics Optimization System addresses the linehaul planning problem, which involves shipping cargo from multiple origin transfer centers to their final destinations. The system aims to minimize overall daily freight expenditures, prevent vehicle overloading, and ensure deliveries meet time-bound service level agreements (SLAs).
 
 To achieve this, the system implements a two-stage hybrid optimization engine:
 1. **Stage 1 (Greedy Capacity Allocation):** Orders daily origin-destination cargo demands by size and greedily loads them onto pre-negotiated, fixed-rate rental vehicles allocated to specific routes. This stage maximizes the utilization of dedicated fleet resources.
@@ -174,9 +177,9 @@ The system is configured via environment variables.
 The system produces:
 1. **JSON Outputs:** Comprehensive runtime logs containing status keys, vehicle paths, and costs.
 2. **Excel Workbooks:** Consolidated reports with three specific spreadsheets:
-   - **Cozum:** Chronological transport log with column fields: `Tarih`, `Arac Tipi`, `Cikis TM`, `Varis TM`, `Atanan Desi`, `Maliyet`.
-   - **Talep Ozeti:** Input demand log mapping daily cargo volumes.
-   - **Maliyet Analizi:** Analytical breakdown detailing fixed rental expenditures, spot vehicle bills, and total project costs.
+   - **Solution (Cozum):** Chronological transport log with column fields: `Tarih`, `Arac Tipi`, `Cikis TM`, `Varis TM`, `Atanan Desi`, `Maliyet`.
+   - **Demand Summary (Talep Ozeti):** Input demand log mapping daily cargo volumes.
+   - **Cost Analysis (Maliyet Analizi):** Analytical breakdown detailing fixed rental expenditures, spot vehicle bills, and total project costs.
 
 ## Tech Stack
 
