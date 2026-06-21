@@ -410,24 +410,21 @@ def build_daily_demand(demand: pd.DataFrame) -> dict[str, dict[str, dict[str, fl
 
 def build_tir_yanasma(coords: dict) -> dict[str, bool]:
     """
-    Önrapor Sert Kısıt #7 (Tır Yanaşma Uygunluğu) uyumluluğu için 
-    her Transfer Merkezi için TIR yanaşma izin durumunu üretir.
+    Her Transfer Merkezi için TIR yanaşma izin durumunu üretir.
+
+    VERİ-DRIVEN: yalnızca koordinat verisinde açıkça 'tir_allowed' alanı
+    geçen şehirler o değeri alır; aksi halde TIR serbesttir (True).
+
+    Hardcoded şehir kısıtı (eski 'restricted_cities') KALDIRILDI:
+    jüri MVP'de "Transfer merkezi kısıtı yoktur" dedi ve Q&A (21 Haz)
+    ekiplerin şartname/veri setinde yer almayan kısıt/varsayım
+    tanımlamasını beklemiyor. Dataset B gerçek 'tir_allowed' alanı
+    sağlarsa burası otomatik olarak onu kullanır.
     """
-    tir_yanasma_dict = {}
-    # Dataset B ve parametre esnekliği için kısıtlı şehirleri şimdiden tanımlıyoruz
-    restricted_cities = {"Bursa", "Konya", "Kayseri", "Trabzon"}
-    
-    for city, info in coords.items():
-        # Eğer koordinat tablosunda özel bir 'tir_allowed' alanı geçilmişse onu baz al,
-        # yoksa önrapor kısıt listesindeki (restricted_cities) şehirlere göre False ata.
-        if "tir_allowed" in info:
-            tir_yanasma_dict[city] = bool(info["tir_allowed"])
-        elif city in restricted_cities:
-            tir_yanasma_dict[city] = False
-        else:
-            tir_yanasma_dict[city] = True  # Varsayılan olarak serbest
-            
-    return tir_yanasma_dict
+    return {
+        city: (bool(info["tir_allowed"]) if "tir_allowed" in info else True)
+        for city, info in coords.items()
+    }
 
 def build_logiai_mvp_contract() -> dict[str, object]:
     coords = load_coordinates()
