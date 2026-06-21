@@ -76,7 +76,9 @@ app.add_middleware(
 )
 
 # Proje kok dizini: src/app/main.py -> ../../ (proje koku)
-DATA_DIR = os.environ.get("DATA_DIR", os.path.join(_PROJECT_ROOT, "data", "raw"))
+# Kaptan yapisi: girdi JSON (Kisi A ciktisi) artik data/processed altinda;
+# data/raw yalnizca ham giris Excel'lerini barindirir.
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(_PROJECT_ROOT, "data", "processed"))
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(_PROJECT_ROOT, "data", "processed"))
 INPUT_JSON = os.environ.get("INPUT_JSON", os.path.join(DATA_DIR, "logiai_mvp_input.json"))
 
@@ -624,14 +626,16 @@ def generate_excel(
     ws3.cell(row=4, column=2, value=round(total_rental + total_spot, 2))
     ws3.cell(row=4, column=1).font = Font(bold=True)
 
-    output_path = os.path.join(OUTPUT_DIR, f"rapor_{tarih}.xlsx")
+    # Kaptan yapisi: 2. juri teslimati proje kokunde sabit adla durur.
+    # Indirme adi tarihi de tasir, boylece kullanici dosyayi tarihle ayirt edebilir.
+    output_path = os.path.join(_PROJECT_ROOT, "2_Arac_Planlama_Ciktisi.xlsx")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     wb.save(output_path)
 
     return FileResponse(
         output_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=f"rapor_{tarih}.xlsx",
+        filename=f"2_Arac_Planlama_Ciktisi_{tarih}.xlsx",
     )
 
 

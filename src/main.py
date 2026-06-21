@@ -51,6 +51,12 @@ from utils.data_loader import DataContractError, available_dates, load_input
 from optimization.greedy import run_greedy_assignment
 from optimization.vrp_solver import run_spot_vrp
 
+# Kaptan yapısı: Kişi B çıktısı varsayılan olarak data/processed altına yazılır.
+# src/main.py -> parent (src) -> parent (proje kökü)
+_DEFAULT_OUTPUT = (
+    Path(__file__).resolve().parent.parent / "data" / "processed" / "optimization_result.json"
+)
+
 
 def _run_pipeline_for_date(
     args_tuple: tuple[dict, str, int],
@@ -284,6 +290,7 @@ def write_json_output(
 ) -> None:
     """Tüm tarih sonuçlarını tek bir JSON dosyasına yazar."""
     path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "run_info": {
             "total_dates": len(results),
@@ -327,8 +334,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output", "-o",
         metavar="FILE",
-        default=None,
-        help="Sonuçların yazılacağı JSON dosyası (isteğe bağlı).",
+        default=str(_DEFAULT_OUTPUT),
+        help=(
+            "Sonuçların yazılacağı JSON dosyası. "
+            f"Varsayılan (kaptan yapısı): {_DEFAULT_OUTPUT}"
+        ),
     )
     parser.add_argument(
         "--time-limit", "-t",

@@ -39,7 +39,7 @@ def _section(title: str):
     print("=" * 55)
 
 
-_INPUT_JSON = "data/raw/logiai_mvp_input.json"
+_INPUT_JSON = "data/processed/logiai_mvp_input.json"
 
 
 def _load_data():
@@ -291,7 +291,7 @@ def test_data_validation():
         from src.utils.data_loader import load_input, DataContractError
 
         # Gerçek JSON başarılı yüklenmeli
-        data = load_input("data/raw/logiai_mvp_input.json")
+        data = load_input("data/processed/logiai_mvp_input.json")
         assert "distance_matrix" in data
         assert "rental_routes" in data
         assert "daily_demand" in data
