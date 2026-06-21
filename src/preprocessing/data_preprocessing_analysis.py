@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 
 # Proje Kök Dizini Tanımı (src/preprocessing/.. -> root)
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def read_raw_file(path: Path | str) -> pd.DataFrame:
     """Excel dosyalarını pandas ile okur."""
