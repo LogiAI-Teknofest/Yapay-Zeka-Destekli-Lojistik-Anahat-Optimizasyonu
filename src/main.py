@@ -302,24 +302,34 @@ def write_excel_output(results: list[PipelineResult], output_path: str | Path) -
     rows = []
     for r in results:
         for a in r.rental_assignments:
+            # Araç Tipini vehicle_id'den çıkaralım
+            vtype_str = "Tır"
+            if "KAMYONET" in a.vehicle_id.upper(): vtype_str = "Kamyonet"
+            elif "HAFIF" in a.vehicle_id.upper(): vtype_str = "Hafif Kamyon"
+            elif "KAM" in a.vehicle_id.upper(): vtype_str = "Kamyon"
+            
             rows.append({
                 "Tarih": r.date,
-                "Çıkış": a.origin,
-                "Varış": a.destination,
-                "Araç Tipi": a.vehicle_id,
+                "Araç Tipi": f"Kiralık {vtype_str}",
+                "Çıkış TM": a.origin,
+                "Varış TM": a.destination,
                 "Atanan Desi": round(a.assigned_desi, 2),
                 "Maliyet": round(a.cost, 2),
+                "Araç Kapasitesi": round(a.capacity_desi, 2),
+                "Araç ID": a.vehicle_id,
                 "Durum": "Kiralık"
             })
         for a in r.spot_assignments:
             route_str = " → ".join(a.route_path) if a.route_path else f"{a.origin} → {a.destination}"
             rows.append({
                 "Tarih": r.date,
-                "Çıkış": a.origin,
-                "Varış": a.destination,
-                "Araç Tipi": a.vehicle_type,
+                "Araç Tipi": f"Spot {a.vehicle_type}",
+                "Çıkış TM": a.origin,
+                "Varış TM": a.destination,
                 "Atanan Desi": round(a.assigned_desi, 2),
                 "Maliyet": round(a.cost, 2),
+                "Araç Kapasitesi": round(a.capacity_desi, 2),
+                "Araç ID": a.vehicle_id,
                 "Durum": f"Spot ({a.source})"
             })
             

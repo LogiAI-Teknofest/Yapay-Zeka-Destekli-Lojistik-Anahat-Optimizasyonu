@@ -116,6 +116,7 @@ class SpotAssignment:
     assigned_desi:  float
     capacity_desi:  float
     cost:           float
+    vehicle_id:     str = ""
     route_path:     tuple[str, ...] = field(default_factory=tuple)
     source:         AssignmentSource = "vrp"
 

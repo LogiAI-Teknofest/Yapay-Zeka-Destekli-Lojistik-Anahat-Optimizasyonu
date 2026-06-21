@@ -613,6 +613,8 @@ class SpotVRPSolver:
             
             route_origin = demands[nodes[0] - 1][0]
             current_location = route_origin
+            # SPOT-ORG-INDEX formatında benzersiz bir ID oluştur
+            vehicle_id = f"SPOT-{route_origin[:3].upper()}-{vid}"
 
             for node_idx in nodes:
                 req_origin, req_dest, req_desi = demands[node_idx - 1]
@@ -632,6 +634,7 @@ class SpotVRPSolver:
                         assigned_desi = req_desi,
                         capacity_desi = vcap,
                         cost          = leg_cost,
+                        vehicle_id    = vehicle_id,
                         route_path    = (current_location, req_dest),
                         source        = "vrp",
                     )
@@ -727,6 +730,7 @@ class SpotVRPSolver:
                         assigned_desi = batch_desi,
                         capacity_desi = vcap,
                         cost          = unit_cost,
+                        vehicle_id    = f"FB-{origin[:3].upper()}-{node_idx}-{batch_no}",
                         route_path    = (origin, dest),
                         source        = "fallback",
                     )
