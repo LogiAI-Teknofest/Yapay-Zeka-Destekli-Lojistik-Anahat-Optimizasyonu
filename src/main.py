@@ -139,7 +139,8 @@ def run_pipeline(
     elif spot_assignments_list:
         solver_status = "FEASIBLE"
     else:
-        solver_status = "OPTIMAL"
+        # Issue 63 Fix: spot_assignments_list boşsa sistem başarısız olmuştur
+        solver_status = "INFEASIBLE"
 
     # ── Atanamayan Talep Kontrolü ─────────────────────────────────────────────
     # Spill'e giren ama spot'a da atanamayan talepler (None dönen fallback)
