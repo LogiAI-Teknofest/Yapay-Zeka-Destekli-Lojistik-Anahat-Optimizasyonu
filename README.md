@@ -152,7 +152,7 @@ The system is configured via environment variables.
 | REDIS_DB | Database index to use within Redis | 0 |
 | DATA_DIR | Directory containing raw input parameters | data/raw |
 | OUTPUT_DIR | Directory where processed files are output | data/processed |
-| INPUT_JSON | Path to the consolidated input JSON | data/raw/logiai_mvp_input.json |
+| INPUT_JSON | Path to the consolidated input JSON | data/processed/logiai_mvp_input.json |
 | API_BASE | Gateway endpoint queried by the dashboard | http://localhost:8000 |
 | ALLOWED_ORIGINS | Comma-separated list of permitted CORS origins | http://localhost:8501 |
 

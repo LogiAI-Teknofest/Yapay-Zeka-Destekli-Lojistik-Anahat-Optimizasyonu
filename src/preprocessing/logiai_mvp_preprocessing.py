@@ -93,7 +93,7 @@ def generate_forecast_and_excel(demand_df: pd.DataFrame, project_root: Path) -> 
     forecast_df = pd.DataFrame(forecast_records)
     
     # 3. Aşama: Şartnamede İstenen Excel Çıktısının Üretilmesi
-    output_excel_path = project_root / "data" / "raw" / "Tahminlenen_Talep.xlsx"
+    output_excel_path = project_root / "1_Tahmin_Talep_Ciktisi.xlsx"
     forecast_df.to_excel(output_excel_path, index=False)
     print(f"[BAŞARI] Şartname uyumlu 'Tahminlenen Talep' Excel'i üretildi: {output_excel_path}")
     
