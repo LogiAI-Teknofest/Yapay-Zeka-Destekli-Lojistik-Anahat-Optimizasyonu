@@ -24,13 +24,22 @@ env/
 .planning
 
 # === Yarışma Veri Setleri ve Çıktılar ===
-# Gerçek veri setleri (.xlsx veya .csv) ve yerel test çıktıları büyük boyutlu 
+# Gerçek veri setleri (.xlsx veya .csv) ve yerel test çıktıları büyük boyutlu
 # olacağı için repoyu şişirmemeli. Sadece kodlar kalmalı.
 *.xlsx
 *.xls
 *.csv
 outputs/
 test_outputs/
+
+# === Kaptan Yapısı: Üretilen Teslimatlar ve Ara Çıktılar ===
+# Bu dosyalar pipeline her çalıştığında yeniden üretilir; repoda tutulmaz.
+# (Üstteki *.xlsx / *.json globları zaten kapsar; aşağısı niyeti belgeler.)
+/1_Tahmin_Talep_Ciktisi.xlsx          # Kişi A — jüri teslimatı 1
+/2_Arac_Planlama_Ciktisi.xlsx         # Kişi D — jüri teslimatı 2
+data/processed/logiai_mvp_input.json  # Kişi A — girdi sözleşmesi
+data/processed/optimization_result.json  # Kişi B — optimizasyon sonucu
+data/processed/rapor_*.xlsx           # eski tarihli rapor çıktıları
 
 # === İşletim Sistemi Dosyaları ===
 # Windows ve Mac'in klasör içi otomatik ürettiği gizli dosyalar
