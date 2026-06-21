@@ -424,13 +424,21 @@ def predict(
 @lru_cache(maxsize=2)
 def _fleet_skeleton(mtime: float) -> tuple[dict, ...]:
     data = load_input(INPUT_JSON)
+    vehicles_info = data.get("vehicles_info", {})
     rows = []
     for route_key, vehicles in data.get("rental_routes", {}).items():
         origin, dest = route_key.split("_", 1)
         for v in vehicles:
-            vtype = v.get("vehicle_type", "Tir")
-            cost_row = data.get("cost_matrix", {}).get(origin, {}).get(dest, {}).get(vtype, {})
-            sabit = float(cost_row.get("kiralik", cost_row.get("kiralık", 0)))
+            vtype = v.get("vehicle_type", "TIR")
+            # FIX #64 - rental_fixed_daily_cost gercek gunluk sabit maliyeti verir.
+            # cost_matrix["kiralik"] tam sefer maliyetidir, yanlis gosteriliyordu.
+            vi = vehicles_info.get(vtype, {})
+            if vi:
+                sabit = float(vi.get("rental_fixed_daily_cost", 0))
+            else:
+                # Eski JSON (vehicles_info yok): cost_matrix fallback
+                cost_row = data.get("cost_matrix", {}).get(origin, {}).get(dest, {}).get(vtype, {})
+                sabit = float(cost_row.get("kiralik", cost_row.get("kiralık", 0)))
             rows.append({
                 "arac_id": v["id"],
                 "tip": vtype,
@@ -438,6 +446,7 @@ def _fleet_skeleton(mtime: float) -> tuple[dict, ...]:
                 "rota": f"{origin}->{dest}",
             })
     return tuple(rows)
+
 
 
 @app.get("/api/fleet", response_model=list[FleetVehicle])
@@ -511,132 +520,197 @@ def tm_status(tarih: Optional[str] = Query(None)):
 
 @app.get("/api/excel")
 def generate_excel(
-    tarih: str = Query(...),
-    time_limit: int = Query(120, ge=1, description="Tamamlanmis job yoksa sync optimizasyon zaman siniri (sn)"),
+    tarih: Optional[str] = Query(None, description="Baslangic tarihi (YYYY-MM-DD); verilmezse 2026-05-11 kullanilir"),
+    time_limit: int = Query(120, ge=1, description="Her gun icin sync optimizasyon zaman siniri (sn)"),
+    gun_sayisi: int = Query(7, ge=1, le=30, description="Kac gunluk planlama uretilecek"),
 ):
     """
-    FIX #35 - Excel ciktisi optimizasyon SONUCUNDAN uretilir (kiralik + spot
-    atamalar). Ana sayfa kolonlari jurinin example_solution.xlsx formatiyla
-    ayni: Tarih, Arac Tipi, Cikis TM, Varis TM, Atanan Desi, Maliyet.
+    FIX #50 (E/F/G) - Iki ayri xlsx + 7 gun loop + Tahminlenen Talep kaynagi.
 
-    Veri kaynagi: once o tarih icin tamamlanmis async job sonucu kullanilir;
-    yoksa boru hatti senkron calistirilir (fallback her kosulda gecerli plan
-    garanti eder).
+    Uretilen dosyalar (ZIP icinde):
+      1. Tahminlenen_Talep.xlsx  - preprocessing'in urettigi dosyadan dogrudan kopyalanir
+                                    (format: Tarih, Cikis TM, Varis TM, Tahmin Edilen Desi)
+      2. Arac_Planlama.xlsx     - gun_sayisi gun boyunca optimizasyon calistirilir;
+                                    juri formati: Tarih, Arac Tipi, Cikis TM, Varis TM,
+                                    Atanan Desi, Maliyet  (kiralik + spot satirlari)
+
+    Tarih araligi: tarih parametresi (varsayilan 2026-05-11) + gun_sayisi gun
     """
+    import io
+    import zipfile
+    import openpyxl
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
-    from fastapi.responses import FileResponse
+    from fastapi.responses import StreamingResponse
 
-    date_demands = get_demand_for_date(tarih)  # FIX #21 - O(1)
-
-    if not date_demands:
-        raise HTTPException(404, f"{tarih} icin veri yok")
+    # --- 0. Ortak stil nesneleri ---
+    header_font  = Font(bold=True, color="FFFFFF")
+    header_fill  = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    center_align = Alignment(horizontal="center")
 
     mvp_data = load_input(INPUT_JSON)
 
-    # FIX #35 - Optimizasyon sonucunu al: once tamamlanmis job, yoksa sync calistir
-    result = None
-    job = _get_job_for_date(tarih)
-    if job and job.get("status") == "COMPLETED":
-        result = job.get("result")
-    if result is None:
-        result = _run_pipeline(mvp_data, tarih, time_limit_sec=time_limit)
-
-    rental_assignments = result.get("rental_assignments", [])
-    spot_assignments   = result.get("spot_assignments", [])
-
-    # FIX #35 - rental atamalarinda vehicle_type yok; rental_routes'tan id->tip eslemesi
+    # rental_routes id -> vehicle_type eslemes
     id_to_vtype: dict[str, str] = {}
     for vehicles in mvp_data.get("rental_routes", {}).values():
         for v in vehicles:
-            id_to_vtype[v["id"]] = v.get("vehicle_type", "Tir")
+            id_to_vtype[v["id"]] = v.get("vehicle_type", "TIR")
 
-    wb = Workbook()
+    # --- 1. DOSYA A: Tahminlenen_Talep.xlsx ---
+    # Oncelik: data/raw/Tahminlened_Talep.xlsx mevcutsa dogrudan oku
+    talep_src = os.path.join(DATA_DIR, "Tahminlenen_Talep.xlsx")
+    if os.path.exists(talep_src):
+        wb_talep = openpyxl.load_workbook(talep_src)
+        ws_talep = wb_talep.active
+        # Baslik satirini standart hale getir
+        ws_talep.cell(row=1, column=1, value="Tarih")
+        ws_talep.cell(row=1, column=2, value="Cikis TM")
+        ws_talep.cell(row=1, column=3, value="Varis TM")
+        ws_talep.cell(row=1, column=4, value="Tahmin Edilen Desi")
+        for col in range(1, 5):
+            c = ws_talep.cell(row=1, column=col)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center_align
+    else:
+        # Fallback: daily_demand'den tahmin olarak goster
+        wb_talep = Workbook()
+        ws_talep = wb_talep.active
+        ws_talep.title = "Tahminlenen Talep"
+        for col, h in enumerate(["Tarih", "Cikis TM", "Varis TM", "Tahmin Edilen Desi"], 1):
+            c = ws_talep.cell(row=1, column=col, value=h)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center_align
+        row_idx = 2
+        for row in load_demand():
+            ws_talep.cell(row=row_idx, column=1, value=row["tarih"])
+            ws_talep.cell(row=row_idx, column=2, value=row["gonderen_id"])
+            ws_talep.cell(row=row_idx, column=3, value=row["alan_id"])
+            ws_talep.cell(row=row_idx, column=4, value=float(row["talep_desi"]))
+            row_idx += 1
 
-    # -- Sayfa 1: Cozum (juri formati) --
-    ws1 = wb.active
-    ws1.title = "Cozum"
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    # --- 2. DOSYA B: Arac_Planlama.xlsx ---
+    # Baslangic tarihini belirle
+    start_str = tarih or "2026-05-11"
+    try:
+        start_date = datetime.date.fromisoformat(start_str)
+    except ValueError:
+        raise HTTPException(400, f"Gecersiz tarih formati: {start_str}. YYYY-MM-DD olmali.")
 
-    # FIX #35 - example_solution.xlsx kolon yapisi
-    headers1 = ["Tarih", "Arac Tipi", "Cikis TM", "Varis TM", "Atanan Desi", "Maliyet"]
-    for col, h in enumerate(headers1, 1):
-        cell = ws1.cell(row=1, column=col, value=h)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
+    # Planlama tarihlerini olustur
+    all_dates_in_data = sorted(available_dates(mvp_data))
+    plan_dates = []
+    for i in range(gun_sayisi):
+        d = (start_date + datetime.timedelta(days=i)).isoformat()
+        if d in all_dates_in_data:
+            plan_dates.append(d)
 
-    row_idx = 2
-    total_rental = 0.0
-    total_spot   = 0.0
+    if not plan_dates:
+        raise HTTPException(404, f"{start_str} tarihinden itibaren {gun_sayisi} gun icinde veri bulunamadi.")
 
-    # Kiralik atamalar
-    for a in rental_assignments:
-        vtype = id_to_vtype.get(a.get("vehicle_id", ""), "Tir")
-        cost  = float(a.get("cost", 0.0))
-        total_rental += cost
-        ws1.cell(row=row_idx, column=1, value=tarih)
-        ws1.cell(row=row_idx, column=2, value=f"Kiralik {vtype}")
-        ws1.cell(row=row_idx, column=3, value=a.get("origin"))
-        ws1.cell(row=row_idx, column=4, value=a.get("destination"))
-        ws1.cell(row=row_idx, column=5, value=round(float(a.get("assigned_desi", 0.0)), 2))
-        ws1.cell(row=row_idx, column=6, value=round(cost, 2))
-        row_idx += 1
+    wb_plan = Workbook()
+    ws_plan = wb_plan.active
+    ws_plan.title = "Arac Planlama"
 
-    # Spot atamalar (FIX #35 - onceki surumde tamamen eksikti)
-    for a in spot_assignments:
-        cost = float(a.get("cost", 0.0))
-        total_spot += cost
-        ws1.cell(row=row_idx, column=1, value=tarih)
-        ws1.cell(row=row_idx, column=2, value=f"Spot {a.get('vehicle_type', '')}")
-        ws1.cell(row=row_idx, column=3, value=a.get("origin"))
-        ws1.cell(row=row_idx, column=4, value=a.get("destination"))
-        ws1.cell(row=row_idx, column=5, value=round(float(a.get("assigned_desi", 0.0)), 2))
-        ws1.cell(row=row_idx, column=6, value=round(cost, 2))
-        row_idx += 1
+    plan_headers = ["Tarih", "Arac Tipi", "Cikis TM", "Varis TM", "Atanan Desi", "Maliyet", "Tur"]
+    for col, h in enumerate(plan_headers, 1):
+        c = ws_plan.cell(row=1, column=col, value=h)
+        c.font = header_font
+        c.fill = header_fill
+        c.alignment = center_align
 
-    # -- Sayfa 2: Talep Ozeti --
-    ws2 = wb.create_sheet("Talep Ozeti")
-    headers2 = ["Tarih", "Gonderen", "Alan", "Talep (desi)"]
-    for col, h in enumerate(headers2, 1):
-        cell = ws2.cell(row=1, column=col, value=h)
-        cell.font = header_font
-        cell.fill = header_fill
+    ws_ozet = wb_plan.create_sheet("Maliyet Ozeti")
+    ozet_headers = ["Tarih", "Kiralik Toplam (TL)", "Spot Toplam (TL)", "Genel Toplam (TL)"]
+    for col, h in enumerate(ozet_headers, 1):
+        c = ws_ozet.cell(row=1, column=col, value=h)
+        c.font = header_font
+        c.fill = header_fill
+        c.alignment = center_align
 
-    for i, r in enumerate(date_demands, 2):
-        ws2.cell(row=i, column=1, value=r["tarih"])
-        ws2.cell(row=i, column=2, value=r["gonderen_id"])
-        ws2.cell(row=i, column=3, value=r["alan_id"])
-        ws2.cell(row=i, column=4, value=float(r["talep_desi"]))  # FIX #1
+    plan_row  = 2
+    ozet_row  = 2
+    grand_rental = 0.0
+    grand_spot   = 0.0
 
-    # -- Sayfa 3: Maliyet Analizi (FIX #35 - gercek spot maliyeti) --
-    ws3 = wb.create_sheet("Maliyet Analizi")
-    headers3 = ["Kalem", "Tutar (TL)"]
-    for col, h in enumerate(headers3, 1):
-        cell = ws3.cell(row=1, column=col, value=h)
-        cell.font = header_font
-        cell.fill = header_fill
+    for gun_tarih in plan_dates:
+        # Optimizasyon sonucunu al: once tamamlanmis async job, yoksa sync calistir
+        result = None
+        job = _get_job_for_date(gun_tarih)
+        if job and job.get("status") == "COMPLETED":
+            result = job.get("result")
+        if result is None:
+            try:
+                result = _run_pipeline(mvp_data, gun_tarih, time_limit_sec=time_limit)
+            except Exception as exc:
+                logger.warning("Excel: %s icin optimizasyon basarisiz: %s", gun_tarih, exc)
+                result = {"rental_assignments": [], "spot_assignments": []}
 
-    ws3.cell(row=2, column=1, value="Kiralik Filo Sabit")
-    ws3.cell(row=2, column=2, value=round(total_rental, 2))
-    ws3.cell(row=3, column=1, value="Spot Arac Degisken")
-    ws3.cell(row=3, column=2, value=round(total_spot, 2))
-    ws3.cell(row=4, column=1, value="TOPLAM")
-    ws3.cell(row=4, column=2, value=round(total_rental + total_spot, 2))
-    ws3.cell(row=4, column=1).font = Font(bold=True)
+        rental_assignments = result.get("rental_assignments", [])
+        spot_assignments   = result.get("spot_assignments", [])
+        day_rental = 0.0
+        day_spot   = 0.0
 
-    # Kaptan yapisi: 2. juri teslimati proje kokunde sabit adla durur.
-    # Indirme adi tarihi de tasir, boylece kullanici dosyayi tarihle ayirt edebilir.
-    output_path = os.path.join(_PROJECT_ROOT, "2_Arac_Planlama_Ciktisi.xlsx")
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    wb.save(output_path)
+        for a in rental_assignments:
+            vtype = id_to_vtype.get(a.get("vehicle_id", ""), "TIR")
+            cost  = float(a.get("cost", 0.0))
+            day_rental += cost
+            ws_plan.cell(row=plan_row, column=1, value=gun_tarih)
+            ws_plan.cell(row=plan_row, column=2, value=f"Kiralik {vtype}")
+            ws_plan.cell(row=plan_row, column=3, value=a.get("origin", ""))
+            ws_plan.cell(row=plan_row, column=4, value=a.get("destination", ""))
+            ws_plan.cell(row=plan_row, column=5, value=round(float(a.get("assigned_desi", 0.0)), 2))
+            ws_plan.cell(row=plan_row, column=6, value=round(cost, 2))
+            ws_plan.cell(row=plan_row, column=7, value="Kiralik")
+            plan_row += 1
 
-    return FileResponse(
-        output_path,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=f"2_Arac_Planlama_Ciktisi_{tarih}.xlsx",
+        for a in spot_assignments:
+            cost = float(a.get("cost", 0.0))
+            day_spot += cost
+            ws_plan.cell(row=plan_row, column=1, value=gun_tarih)
+            ws_plan.cell(row=plan_row, column=2, value=f"Spot {a.get('vehicle_type', '')}")
+            ws_plan.cell(row=plan_row, column=3, value=a.get("origin", ""))
+            ws_plan.cell(row=plan_row, column=4, value=a.get("destination", ""))
+            ws_plan.cell(row=plan_row, column=5, value=round(float(a.get("assigned_desi", 0.0)), 2))
+            ws_plan.cell(row=plan_row, column=6, value=round(cost, 2))
+            ws_plan.cell(row=plan_row, column=7, value="Spot")
+            plan_row += 1
+
+        ws_ozet.cell(row=ozet_row, column=1, value=gun_tarih)
+        ws_ozet.cell(row=ozet_row, column=2, value=round(day_rental, 2))
+        ws_ozet.cell(row=ozet_row, column=3, value=round(day_spot, 2))
+        ws_ozet.cell(row=ozet_row, column=4, value=round(day_rental + day_spot, 2))
+        ozet_row += 1
+
+        grand_rental += day_rental
+        grand_spot   += day_spot
+
+    # Toplam satiri
+    ws_ozet.cell(row=ozet_row, column=1, value="GENEL TOPLAM")
+    ws_ozet.cell(row=ozet_row, column=2, value=round(grand_rental, 2))
+    ws_ozet.cell(row=ozet_row, column=3, value=round(grand_spot, 2))
+    ws_ozet.cell(row=ozet_row, column=4, value=round(grand_rental + grand_spot, 2))
+    for col in range(1, 5):
+        ws_ozet.cell(row=ozet_row, column=col).font = Font(bold=True)
+
+    # --- 3. ZIP icinde sun ---
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        talep_buf = io.BytesIO()
+        wb_talep.save(talep_buf)
+        zf.writestr("Tahminlenen_Talep.xlsx", talep_buf.getvalue())
+
+        plan_buf = io.BytesIO()
+        wb_plan.save(plan_buf)
+        zf.writestr("Arac_Planlama.xlsx", plan_buf.getvalue())
+
+    zip_buf.seek(0)
+    return StreamingResponse(
+        zip_buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="logiai_cikti_{start_str}.zip"'},
     )
+
 
 
 @app.get("/api/cities")
@@ -675,26 +749,48 @@ def list_dates():
 @app.get("/api/vehicles")
 def list_vehicles():
     """
-    FIX #2 - Arac tipi bilgileri artik logiai_mvp_input.json'dan turetiliyor.
-    JSON'da 'vehicle_types' anahtari yoksa statik fallback kullanilir.
+    FIX #32 - Arac tipi bilgileri vehicles_info'dan okunuyor (gercek kapasite+maliyet).
+    vehicle_types varsa o kullanilir; yoksa vehicles_info yapilandirilir;
+    o da yoksa cost_matrix'ten benzersiz tipler + statik fallback devreye girer.
     """
     data = load_input(INPUT_JSON)
+
+    # Oncelik 1: vehicle_types anahtari
     if "vehicle_types" in data:
         return {"arac_tipleri": data["vehicle_types"]}
 
-    # Fallback: cost_matrix'ten benzersiz arac tiplerini topla
+    # Oncelik 2: vehicles_info (FIX #32 - gercek kapasite ve maliyet)
+    vehicles_info = data.get("vehicles_info", {})
+    if vehicles_info:
+        # tir_yanasma JSON'daki transfer_centers'ten anlasilabilir; JSON'da
+        # vehicle_types yoksa kodu koda donustur
+        _tir_required = {"TIR": True, "KAM": False, "HAF": False, "KMT": False}
+        arac_tipleri = []
+        for code, info in vehicles_info.items():
+            arac_tipleri.append({
+                "id": code,
+                "ad": info.get("name", code),
+                "kapasite_desi": info.get("capacity_desi", 0),
+                "sabit_maliyet": info.get("rental_fixed_daily_cost", 0.0),
+                "km_basi_maliyet": info.get("rental_cost_per_km", 0.0),
+                "spot_sabit_maliyet": info.get("spot_fixed_daily_cost", 0.0),
+                "spot_km_basi_maliyet": info.get("spot_cost_per_km", 0.0),
+                "tir_yanasma_gerekli": _tir_required.get(code, False),
+            })
+        return {"arac_tipleri": arac_tipleri}
+
+    # Fallback: cost_matrix'ten benzersiz arac tiplerini topla + statik tablo
     cost_matrix = data.get("cost_matrix", {})
     seen: set[str] = set()
     for origin_data in cost_matrix.values():
         for dest_data in origin_data.values():
             seen.update(dest_data.keys())
 
-    # Statik kapasite tablosu (JSON'dan okunamazsa)
     _static_caps = {
-        "Tir": {"id": "TIR", "ad": "Tir", "kapasite_desi": 22400, "sabit_maliyet": 7000.0, "km_basi_maliyet": 13.0, "tir_yanasma_gerekli": True},
-        "Kamyon": {"id": "KAM", "ad": "Kamyon", "kapasite_desi": 12000, "sabit_maliyet": 5000.0, "km_basi_maliyet": 10.0, "tir_yanasma_gerekli": False},
-        "Hafif Kamyon": {"id": "HAF", "ad": "Hafif Kamyon", "kapasite_desi": 7200, "sabit_maliyet": 5000.0, "km_basi_maliyet": 10.0, "tir_yanasma_gerekli": False},
-        "Kamyonet": {"id": "KMT", "ad": "Kamyonet", "kapasite_desi": 5600, "sabit_maliyet": 3750.0, "km_basi_maliyet": 6.0, "tir_yanasma_gerekli": False},
+        "TIR": {"id": "TIR", "ad": "Tir", "kapasite_desi": 22400, "sabit_maliyet": 7000.0, "km_basi_maliyet": 13.0, "tir_yanasma_gerekli": True},
+        "KAM": {"id": "KAM", "ad": "Kamyon", "kapasite_desi": 12000, "sabit_maliyet": 5000.0, "km_basi_maliyet": 10.0, "tir_yanasma_gerekli": False},
+        "HAF": {"id": "HAF", "ad": "Hafif Kamyon", "kapasite_desi": 7200, "sabit_maliyet": 5000.0, "km_basi_maliyet": 10.0, "tir_yanasma_gerekli": False},
+        "KMT": {"id": "KMT", "ad": "Kamyonet", "kapasite_desi": 5600, "sabit_maliyet": 3750.0, "km_basi_maliyet": 6.0, "tir_yanasma_gerekli": False},
     }
     arac_tipleri = [_static_caps[t] for t in seen if t in _static_caps]
     if not arac_tipleri:

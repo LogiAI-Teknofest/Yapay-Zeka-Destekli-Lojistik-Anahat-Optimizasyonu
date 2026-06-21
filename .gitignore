@@ -11,6 +11,7 @@ venv/
 venv_*/
 ENV/
 env/
+.venv310
 
 # === Proje ve IDE Ayarları ===
 # VS Code kullananların kişisel editör ayarları
