@@ -134,6 +134,8 @@ def _cheapest_spot_vehicle(
     (vehicle_type, unit_cost, capacity_desi) veya None
     """
     best: tuple[str, float, float] | None = None
+    if remaining_desi <= 0:
+        return best
     best_cost_per_desi = float("inf")
 
     for vtype, cap in spot_caps.items():
@@ -374,12 +376,22 @@ class SpotVRPSolver:
             def km_cb(from_idx: int, to_idx: int) -> int:
                 fi = manager.IndexToNode(from_idx)
                 ti = manager.IndexToNode(to_idx)
-                if fi == _DEPOT or ti == _DEPOT:
+                
+                # Issue 45 Fix: Dönüş maliyeti (Open VRP) her zaman 0'dır
+                if ti == _DEPOT:
                     return 0
-                o = demands[fi - 1][0]
-                d = demands[ti - 1][1]
+                
+                # Issue 45 Fix: Depodan (Origin) ilk çıkış bedava DEĞİLDİR
+                if fi == _DEPOT:
+                    o = demands[ti - 1][0]  # Ortak Origin
+                    d = demands[ti - 1][1]  # İlk Varış noktası
+                else:
+                    o = demands[fi - 1][1]  # Bir önceki teslimatın varış noktası
+                    d = demands[ti - 1][1]  # Şimdiki teslimatın varış noktası
+                    
                 if o == d:
                     return 0
+                
                 c = _safe_spot_cost(self._cost_matrix, o, d, vtype)
                 return _INFEASIBLE_COST if c == float("inf") else int(c * _COST_SCALE)
             return km_cb
@@ -606,7 +618,8 @@ class SpotVRPSolver:
                 req_origin, req_dest, req_desi = demands[node_idx - 1]
                 
                 c = _safe_spot_cost(self._cost_matrix, current_location, req_dest, vtype)
-                arc_cost = c if c != float("inf") else 0.0
+                # Issue 48 Fix: inf maliyeti bedava sanma, aşırı yüksek bir rakam yansıt
+                arc_cost = c if c != float("inf") else float(_INFEASIBLE_COST)
                 
                 leg_cost = round(fixed_cost_remaining + arc_cost, 2)
                 fixed_cost_remaining = 0.0   # sonraki duraklar sabit bedel ödemez
@@ -696,9 +709,15 @@ class SpotVRPSolver:
             for batch_no in range(n_vehicles):
                 batch_desi = min(vcap, desi - batch_no * vcap)
 
-                # Fallback: Bu parça ne kadar küçük olursa olsun (ör. 10 desi), 
-                # şartname gereği "kaba rota" ile atanıp gönderilmelidir. 
-                # Aksi takdirde pipeline tıkanır. Fix-52 burada bilinçli iptal edildi.
+                # Issue 47 Fix: Şartname Kuralı (Spot araç %10 doluluğa ulaşmazsa YOLA ÇIKAMAZ)
+                # Bu yük sonraki güne devredilmeli / atanamayan olarak kalmalıdır.
+                if batch_desi < vcap * _MIN_LOAD_RATIO:
+                    log.warning(
+                        "Fallback: %s → %s kapasitesinin %%%d altinda "
+                        "(%.1f / %.1f). Yola CIKAMAZ! (Ertesi gune kalacak).",
+                        origin, dest, int(_MIN_LOAD_RATIO * 100), batch_desi, vcap
+                    )
+                    continue
 
                 fallback.append(
                     SpotAssignment(

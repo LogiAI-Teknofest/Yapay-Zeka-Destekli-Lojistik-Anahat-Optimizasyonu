@@ -145,12 +145,13 @@ def _lookup_rental_cost(
         if cost is not None:
             return float(cost)
 
-    raise DataContractError(
-        f"Kiralık maliyet eksik: cost_matrix['{origin}']['{dest}']"
-        f"['{canonical}']['kiralik'|'kiralık']. "
-        f"Mevcut anahtarlar: "
-        f"{list(cost_matrix.get(origin, {}).get(dest, {}).keys())}"
+    log.warning(
+        "Kiralık maliyet eksik: cost_matrix['%s']['%s']['%s']['kiralik'|'kiralık']. "
+        "Mevcut anahtarlar: %s. Araç atlanacak.",
+        origin, dest, canonical,
+        list(cost_matrix.get(origin, {}).get(dest, {}).keys()),
     )
+    return float("inf")
 
 
 def _build_vehicle_pool(
@@ -188,8 +189,14 @@ def _build_vehicle_pool(
             cap = float(vehicle["capacity_desi"])
             vclass = _infer_vehicle_class(vid)
 
-            # Bug-06: fail-fast lookup — 0.0 fallback yok
+            # Bug-06: graceful degradation — maliyet yoksa aracı atla
             unit_cost = _lookup_rental_cost(cost_matrix, origin, dest, vclass)
+            if unit_cost == float("inf"):
+                log.warning(
+                    "Araç '%s' atlandı (kiralık maliyet bulunamadı: %s → %s).",
+                    vid, origin, dest,
+                )
+                continue
 
             pool[vid] = {
                 "origin":    origin,
