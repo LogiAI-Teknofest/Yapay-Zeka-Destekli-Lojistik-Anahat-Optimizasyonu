@@ -28,7 +28,9 @@ except ImportError:
 
 
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
-OUTPUT_PATH = PROJECT_ROOT / "data" / "raw" / "logiai_mvp_input.json"
+# Kaptan yapısı: üretilen JSON girdi sözleşmesi data/processed/ altına yazılır
+# (data/raw yalnızca ham giriş Excel'lerini barındırır).
+OUTPUT_PATH = PROJECT_ROOT / "data" / "processed" / "logiai_mvp_input.json"
 DEFAULT_TRANSFER_CENTER_CAPACITY_DESI = 10_000_000
 DEFAULT_TIR_ALLOWED = True
 
@@ -93,7 +95,8 @@ def generate_forecast_and_excel(demand_df: pd.DataFrame, project_root: Path) -> 
     forecast_df = pd.DataFrame(forecast_records)
     
     # 3. Aşama: Şartnamede İstenen Excel Çıktısının Üretilmesi
-    output_excel_path = project_root / "data" / "raw" / "Tahminlenen_Talep.xlsx"
+    # Kaptan yapısı: 1. jüri teslimatı proje kökünde sabit adla durur.
+    output_excel_path = project_root / "1_Tahmin_Talep_Ciktisi.xlsx"
     forecast_df.to_excel(output_excel_path, index=False)
     print(f"[BAŞARI] Şartname uyumlu 'Tahminlenen Talep' Excel'i üretildi: {output_excel_path}")
     
@@ -411,7 +414,7 @@ def build_tir_yanasma(coords: dict) -> dict[str, bool]:
     
     for city, info in coords.items():
         # Eğer koordinat tablosunda özel bir 'tir_allowed' alanı geçilmişse onu baz al,
-        # Yoksa jüri parameters.json / önrapor kısıt listesindeki şehirlere göre False ata
+        # yoksa önrapor kısıt listesindeki (restricted_cities) şehirlere göre False ata.
         if "tir_allowed" in info:
             tir_yanasma_dict[city] = bool(info["tir_allowed"])
         elif city in restricted_cities:
