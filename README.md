@@ -1,7 +1,6 @@
 # LogiAI Logistics Optimization System
 
-> [!IMPORTANT]
-> **🏆 Grand Total Optimization Cost / Toplam Optimizasyon Maliyeti (May 11-17, 2026):** **14,369,681.90 TL**
+**Grand Total Optimization Cost / Toplam Optimizasyon Maliyeti (May 11-17, 2026):** **14,369,681.90 TL**
 
 Decision support system that optimizes logistics linehaul transportation capacity allocation and vehicle routing to minimize costs under volume, fleet, and site constraints.
 
