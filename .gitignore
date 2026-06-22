@@ -27,6 +27,7 @@ env/
 # === Yarışma Veri Setleri ve Çıktılar ===
 # Gerçek veri setleri (.xlsx veya .csv) ve yerel test çıktıları büyük boyutlu
 # olacağı için repoyu şişirmemeli. Sadece kodlar kalmalı.
+*.zip
 *.xlsx
 *.xls
 *.csv
