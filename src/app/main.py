@@ -549,32 +549,43 @@ def _build_excel_zip_bytes(start_str: str, gun_sayisi: int, time_limit: int) -> 
     # --- 1. DOSYA A: 1_Tahmin_Talep_Ciktisi.xlsx ---
     # Yeni yapi: preprocessing forecast'i repo koküne 1_Tahmin_Talep_Ciktisi.xlsx
     # olarak yazar; mevcutsa dogrudan oku.
-    talep_src = os.path.join(_PROJECT_ROOT, "1_Tahmin_Talep_Ciktisi.xlsx")
-    if os.path.exists(talep_src):
+    # FIX #76 - Forecast kaynagi sira: data/processed (Docker volume-mount) ->
+    # proje koku -> eski ad. Kok dizin container'a kopyalanmadigindan once
+    # OUTPUT_DIR (data/processed) denenir.
+    talep_candidates = [
+        os.path.join(OUTPUT_DIR, "1_Tahmin_Talep_Ciktisi.xlsx"),
+        os.path.join(_PROJECT_ROOT, "1_Tahmin_Talep_Ciktisi.xlsx"),
+        os.path.join(OUTPUT_DIR, "Tahminlenen_Talep.xlsx"),
+    ]
+    talep_src = next((p for p in talep_candidates if os.path.exists(p)), None)
+    if talep_src:
         wb_talep = openpyxl.load_workbook(talep_src)
         ws_talep = wb_talep.active
-        # Baslik satirini standart hale getir
-        ws_talep.cell(row=1, column=1, value="Tarih")
-        ws_talep.cell(row=1, column=2, value="Cikis TM")
-        ws_talep.cell(row=1, column=3, value="Varis TM")
-        ws_talep.cell(row=1, column=4, value="Tahmin Edilen Desi")
-        for col in range(1, 5):
-            c = ws_talep.cell(row=1, column=col)
+        for col, h in enumerate(["Tarih", "Çıkış TM", "Varış TM", "Tahmin Edilen Desi"], 1):
+            c = ws_talep.cell(row=1, column=col, value=h)
             c.font = header_font
             c.fill = header_fill
             c.alignment = center_align
     else:
-        # Fallback: daily_demand'den tahmin olarak goster
+        # FIX #76 - Forecast dosyasi yoksa daily_demand'den uret AMA yalnizca
+        # planlanan gun penceresini (start_str + gun_sayisi) yaz; tum 137 gunu DOKME.
+        try:
+            _sd = datetime.date.fromisoformat(start_str)
+        except ValueError:
+            _sd = datetime.date(2026, 5, 11)
+        _window = {(_sd + datetime.timedelta(days=i)).isoformat() for i in range(gun_sayisi)}
         wb_talep = Workbook()
         ws_talep = wb_talep.active
         ws_talep.title = "Tahminlenen Talep"
-        for col, h in enumerate(["Tarih", "Cikis TM", "Varis TM", "Tahmin Edilen Desi"], 1):
+        for col, h in enumerate(["Tarih", "Çıkış TM", "Varış TM", "Tahmin Edilen Desi"], 1):
             c = ws_talep.cell(row=1, column=col, value=h)
             c.font = header_font
             c.fill = header_fill
             c.alignment = center_align
         row_idx = 2
         for row in load_demand():
+            if row["tarih"] not in _window:
+                continue
             ws_talep.cell(row=row_idx, column=1, value=row["tarih"])
             ws_talep.cell(row=row_idx, column=2, value=row["gonderen_id"])
             ws_talep.cell(row=row_idx, column=3, value=row["alan_id"])
@@ -602,7 +613,7 @@ def _build_excel_zip_bytes(start_str: str, gun_sayisi: int, time_limit: int) -> 
     ws_plan = wb_plan.active
     ws_plan.title = "Arac Planlama"
 
-    plan_headers = ["Tarih", "Arac Tipi", "Cikis TM", "Varis TM", "Atanan Desi", "Maliyet", "Tur"]
+    plan_headers = ["Tarih", "Araç Tipi", "Çıkış TM", "Varış TM", "Atanan Desi", "Maliyet", "Tür"]
     for col, h in enumerate(plan_headers, 1):
         c = ws_plan.cell(row=1, column=col, value=h)
         c.font = header_font
@@ -627,7 +638,10 @@ def _build_excel_zip_bytes(start_str: str, gun_sayisi: int, time_limit: int) -> 
         result = None
         job = _get_job_for_date(gun_tarih)
         if job and job.get("status") == "COMPLETED":
-            result = job.get("result")
+            cached = job.get("result") or {}
+            # FIX - bos/bayat cache'i kullanma; atama yoksa yeniden hesapla
+            if cached.get("rental_assignments") or cached.get("spot_assignments"):
+                result = cached
         if result is None:
             try:
                 result = _run_pipeline(mvp_data, gun_tarih, time_limit_sec=time_limit)
@@ -645,12 +659,12 @@ def _build_excel_zip_bytes(start_str: str, gun_sayisi: int, time_limit: int) -> 
             cost  = float(a.get("cost", 0.0))
             day_rental += cost
             ws_plan.cell(row=plan_row, column=1, value=gun_tarih)
-            ws_plan.cell(row=plan_row, column=2, value=f"Kiralik {vtype}")
+            ws_plan.cell(row=plan_row, column=2, value=f"Kiralık {vtype}")
             ws_plan.cell(row=plan_row, column=3, value=a.get("origin", ""))
             ws_plan.cell(row=plan_row, column=4, value=a.get("destination", ""))
             ws_plan.cell(row=plan_row, column=5, value=round(float(a.get("assigned_desi", 0.0)), 2))
             ws_plan.cell(row=plan_row, column=6, value=round(cost, 2))
-            ws_plan.cell(row=plan_row, column=7, value="Kiralik")
+            ws_plan.cell(row=plan_row, column=7, value="Kiralık")
             plan_row += 1
 
         for a in spot_assignments:
