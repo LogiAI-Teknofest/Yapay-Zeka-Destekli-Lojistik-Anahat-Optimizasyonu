@@ -1,5 +1,14 @@
 # LogiAI Logistics Optimization System
 
+> **Project Status:** This project was developed as a fully functional MVP for the
+> Teknofest 2026 LogiAI competition, achieving an optimization cost of 14,364,318.20 TL
+> for the May 11–17 period. Development was halted after the MVP stage of the competition;
+> the repository has been frozen as a reference architecture (archived) and set to read-only.
+> The two-stage optimization engine (Greedy + OR-Tools VRP) is fully operational.
+
+![Dashboard overview — cost KPIs and assignment breakdown](docs/overview.png)
+<p align="center"><em>Decision-support dashboard: total / rental / spot cost KPIs, cost split, and the rental-vs-spot-vs-fallback assignment breakdown for the selected day.</em></p>
+
 **Grand Total Optimization Cost / Toplam Optimizasyon Maliyeti (May 11-17, 2026):** **14,364,318.20 TL**
 
 Decision support system that optimizes logistics linehaul transportation capacity allocation and vehicle routing to minimize costs under volume, fleet, and site constraints.
@@ -13,6 +22,9 @@ To achieve this, the system implements a two-stage hybrid optimization engine:
 2. **Stage 2 (OR-Tools Spot VRP):** Aggregates any remaining overflow (spill demand) by origin. Each origin's overflow is solved as an independent Open Vehicle Routing Problem (VRP) using Google OR-Tools. The solver routes and assigns spot vehicles from a heterogeneous fleet under strict constraints, including a 10% minimum load threshold for active spot trucks and truck-docking restrictions.
 
 The system outputs detailed assignment logs, GIS routing trajectories, and cost breakdowns. These outputs are served via a FastAPI gateway, rendered on an interactive Streamlit dashboard, and compiled into multi-sheet Excel reports. Long-running optimization tasks are handled asynchronously using a Redis-backed job queue and polling pattern, preventing UI blocks and HTTP timeouts. While the current setup serves demand forecasting via a placeholder statistical baseline endpoint (`/api/predict`), the architecture is fully designed to integrate a future deep-learning LSTM (Long Short-Term Memory) time-series forecasting model.
+
+![Route optimization map — vehicle routes across Turkey](docs/screenshot.png)
+<p align="center"><em>Interactive route map: transfer centers (blue), demand clusters (green), and the optimized rental (green) & spot (red) vehicle routes for a single planning day.</em></p>
 
 ## Assumptions & Design Decisions
 
