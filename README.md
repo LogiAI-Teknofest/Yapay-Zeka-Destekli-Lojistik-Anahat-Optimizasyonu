@@ -2,7 +2,9 @@
 
 > **Project Status:** This project was developed as a fully functional MVP for the
 > Teknofest 2026 LogiAI competition, achieving an optimization cost of 14,364,318.20 TL
-> for the May 11–17 period. The two-stage optimization engine (Greedy + OR-Tools VRP) is fully operational.
+> for the May 11–17 period. Development was halted after the MVP stage of the competition;
+> the repository has been frozen as a reference architecture (archived) and set to read-only.
+> The two-stage optimization engine (Greedy + OR-Tools VRP) is fully operational.
 
 ![Dashboard overview — cost KPIs and assignment breakdown](docs/overview.png)
 <p align="center"><em>Decision-support dashboard: total / rental / spot cost KPIs, cost split, and the rental-vs-spot-vs-fallback assignment breakdown for the selected day.</em></p>
